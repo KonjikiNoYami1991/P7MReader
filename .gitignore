@@ -1,0 +1,15 @@
+# Build PyInstaller
+build/
+dist/
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store
