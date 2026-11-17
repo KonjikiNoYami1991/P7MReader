@@ -21,9 +21,99 @@ Dalla pagina **[Releases](https://github.com/KonjikiNoYami1991/P7MReader/release
 |---|---|---|
 | Windows 10/11 | `P7MReader-<versione>-windows-x64.exe` | Un solo eseguibile, nessuna installazione |
 | macOS 12+ (Apple Silicon / Intel) | `P7MReader-<versione>-macOS-arm64.dmg` / `-x86_64.dmg` | App non firmata: al primo avvio *clic destro → Apri* |
-| Linux x86_64 | `P7MReader-<versione>-x86_64.AppImage` | `chmod +x` e avvio; in alternativa il `.tar.gz` con `installa-linux.sh` |
+| Linux x86_64 | `P7MReader-<versione>-x86_64.AppImage` oppure `-linux-x86_64.tar.gz` | Vedi [Linux](#linux) qui sotto |
 
-Il file `SHA256SUMS.txt` della release contiene le impronte per controllare l'integrità dei download.
+Il file `SHA256SUMS.txt` della release contiene le impronte per controllare l'integrità dei download:
+
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing
+```
+
+## Linux
+
+Ci sono due pacchetti, con lo stesso programma dentro. Funzionano su distribuzioni x86_64 recenti (glibc 2.35 o successiva: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, openSUSE Leap 15.5+ e simili). Nessuno dei due richiede permessi di amministratore.
+
+| Pacchetto | Quando sceglierlo |
+|---|---|
+| **AppImage** | Un solo file da scaricare e avviare, niente installazione. Comodo per provarlo o tenerlo su una chiavetta |
+| **tar.gz** | Installazione vera per l'utente: voce nel menu delle applicazioni, icona, comando `p7mreader` nel terminale, apertura dei file con *Apri con…* |
+
+### AppImage: avvio senza installare
+
+```bash
+chmod +x P7MReader-*-x86_64.AppImage
+```
+
+```bash
+./P7MReader-*-x86_64.AppImage
+```
+
+Oppure dal file manager: *Proprietà → Permessi → Consenti l'esecuzione come programma*, poi doppio clic.
+
+Se non parte e compare un errore su **FUSE** (`libfuse.so.2`), installa la libreria FUSE 2:
+
+```bash
+sudo apt install libfuse2t64
+```
+
+(su Ubuntu 22.04 e Debian 12 il pacchetto si chiama `libfuse2`; su Fedora `sudo dnf install fuse-libs`). In alternativa, senza installare niente:
+
+```bash
+./P7MReader-*-x86_64.AppImage --appimage-extract-and-run
+```
+
+**Metterlo nel menu delle applicazioni** (facoltativo): il modo più semplice è un gestore di AppImage come *Gear Lever* (Flathub) o *AppImageLauncher*. A mano:
+
+```bash
+mkdir -p ~/Applications ~/.local/share/applications ~/.local/share/icons/hicolor/256x256/apps
+mv P7MReader-*-x86_64.AppImage ~/Applications/P7MReader.AppImage
+cd ~/Applications && ./P7MReader.AppImage --appimage-extract p7mreader.png
+mv squashfs-root/p7mreader.png ~/.local/share/icons/hicolor/256x256/apps/ && rm -rf squashfs-root
+cat > ~/.local/share/applications/p7mreader.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=P7MReader
+Exec="$HOME/Applications/P7MReader.AppImage" %F
+Icon=p7mreader
+Categories=Office;Viewer;Security;
+MimeType=application/pkcs7-mime;application/pkcs7-signature;application/pdf;application/xml;
+Terminal=false
+EOF
+```
+
+Per aggiornare basta sostituire `~/Applications/P7MReader.AppImage` con la versione nuova.
+
+### tar.gz: installazione nel sistema (per l'utente corrente)
+
+```bash
+tar -xzf P7MReader-*-linux-x86_64.tar.gz
+```
+
+```bash
+cd P7MReader-*-linux-x86_64
+```
+
+```bash
+./installa-linux.sh
+```
+
+Lo script copia il programma in `~/.local/opt/p7mreader`, crea il comando `p7mreader` in `~/.local/bin` e aggiunge la voce con l'icona nel menu delle applicazioni. Da quel momento P7MReader compare anche in *Apri con…* per i file `.p7m`, `.p7s`, PDF e XML. La cartella estratta si può cancellare.
+
+Se il terminale dice che `p7mreader` non esiste, `~/.local/bin` non è nel `PATH` (succede su alcune distribuzioni finché non si esce e si rientra nella sessione). Si può aggiungere così:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
+- **Aggiornare**: estrai il `.tar.gz` della versione nuova e lancia di nuovo `./installa-linux.sh`. Sostituisce il programma e lascia intatte le impostazioni.
+- **Disinstallare**: dalla cartella estratta, `./installa-linux.sh --rimuovi`. Le impostazioni e la cache restano in `~/.config/P7MReader`: cancellala a mano se vuoi togliere tutto.
+- **Senza installare**: dopo l'estrazione si può avviare direttamente `./P7MReader/P7MReader`.
+
+### Se il programma non si apre
+
+- Avvialo da terminale per vedere il messaggio d'errore. Gli errori vengono anche scritti in `~/.config/P7MReader/errori.log`.
+- `could not load the Qt platform plugin "xcb"`: manca una libreria grafica di sistema, di solito `libxcb-cursor0` (`sudo apt install libxcb-cursor0`; su Fedora `xcb-util-cursor`).
+- Funziona su X11 e su Wayland. Se su Wayland la finestra si comporta in modo strano, prova a forzare X11: `QT_QPA_PLATFORM=xcb p7mreader`.
 
 ## Lingua
 
