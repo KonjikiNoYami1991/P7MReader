@@ -19,9 +19,22 @@ Dalla pagina **[Releases](https://github.com/KonjikiNoYami1991/P7MReader/release
 
 | Sistema | File | Note |
 |---|---|---|
-| Windows 10/11 | `P7MReader-<versione>-windows-x64.exe` | Un solo eseguibile, nessuna installazione |
-| macOS 12+ (Apple Silicon / Intel) | `P7MReader-<versione>-macOS-arm64.dmg` / `-x86_64.dmg` | App non firmata: al primo avvio *clic destro → Apri* |
+| Windows 11 (anche 10) | `P7MReader-<versione>-windows-x64.exe` | Un solo eseguibile, nessuna installazione |
+| macOS 12+ fino a macOS 26 Tahoe (Apple Silicon / Intel) | `P7MReader-<versione>-macOS-arm64.dmg` / `-x86_64.dmg` | App non firmata: vedi [primo avvio su macOS](#primo-avvio-su-macos) |
 | Linux x86_64 | `P7MReader-<versione>-x86_64.AppImage` oppure `-linux-x86_64.tar.gz` | Vedi [Linux](#linux) qui sotto |
+
+### Primo avvio su macOS
+
+L'app non è firmata da uno sviluppatore registrato Apple, quindi il primo avvio va autorizzato una volta:
+
+- **macOS 15 Sequoia e successivi** (compreso macOS 26 Tahoe): apri l'app, chiudi l'avviso, poi *Impostazioni di Sistema → Privacy e sicurezza → Apri comunque* e conferma. Il vecchio *clic destro → Apri* qui non funziona più.
+- **macOS 12-14**: *clic destro sull'app → Apri → Apri*.
+
+In alternativa, dal Terminale, dopo averla copiata in Applicazioni:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/P7MReader.app
+```
 
 Il file `SHA256SUMS.txt` della release contiene le impronte per controllare l'integrità dei download:
 
@@ -31,7 +44,7 @@ sha256sum -c SHA256SUMS.txt --ignore-missing
 
 ## Linux
 
-Ci sono due pacchetti, con lo stesso programma dentro. Funzionano su distribuzioni x86_64 recenti (glibc 2.35 o successiva: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, Arch, openSUSE Tumbleweed e Leap 15.6+, RHEL/AlmaLinux/Rocky 10 e simili; la [tabella per distribuzione](#distribuzione-per-distribuzione) dice cosa serve su ciascuna). Nessuno dei due richiede permessi di amministratore.
+Ci sono due pacchetti, con lo stesso programma dentro. Funzionano sulle distribuzioni desktop x86_64 con glibc 2.35 o successiva: dalle ultime release (Ubuntu 26.04 LTS e 26.10, Fedora 45, Debian 13, Linux Mint 22, openSUSE Leap 16 e Tumbleweed, Arch, RHEL/AlmaLinux/Rocky 10) fino a Ubuntu 22.04, Debian 12 e Leap 15.6; la [tabella per distribuzione](#distribuzione-per-distribuzione) dice cosa serve su ciascuna). Nessuno dei due richiede permessi di amministratore.
 
 | Pacchetto | Quando sceglierlo |
 |---|---|
@@ -50,13 +63,13 @@ chmod +x P7MReader-*-x86_64.AppImage
 
 Oppure dal file manager: *Proprietà → Permessi → Consenti l'esecuzione come programma*, poi doppio clic.
 
-Se non parte e compare un errore su **FUSE** (`libfuse.so.2`), installa la libreria FUSE 2:
+L'AppImage usa il runtime statico attuale: **non serve `libfuse2`**, basta il programma `fusermount` del pacchetto **`fuse3`**, già presente su quasi tutti i desktop. Se compare `No suitable fusermount binary found on the $PATH`, installalo:
 
 ```bash
-sudo apt install libfuse2t64
+sudo apt install fuse3
 ```
 
-(su Ubuntu 22.04 e Debian 12 il pacchetto si chiama `libfuse2`; per Fedora, Arch, openSUSE e le altre vedi [distribuzione per distribuzione](#distribuzione-per-distribuzione)). In alternativa, senza installare niente:
+(Fedora, RHEL, Arch e openSUSE: pacchetto `fuse3` con `dnf`, `pacman` o `zypper`). In alternativa, senza installare niente:
 
 ```bash
 ./P7MReader-*-x86_64.AppImage --appimage-extract-and-run
@@ -115,34 +128,28 @@ Cosa serve, in breve, sulle famiglie principali. *Pacchetti* = AppImage e tar.gz
 
 | Famiglia | Esempi | Pacchetti | Sorgente |
 |---|---|---|---|
-| Debian / Ubuntu | Debian 12+, Ubuntu 22.04+, Mint 21+, Pop!_OS, elementary, Zorin | Sì | Sì (Debian 12 e Ubuntu 22.04: Python troppo vecchio, usa `uv`) |
-| Fedora | Fedora Workstation, spin KDE, Nobara | Sì | Sì |
+| Debian / Ubuntu | Debian 13 e 12, Ubuntu 26.10, 26.04, 24.04, 22.04, Mint 22 e 21, Pop!_OS, elementary, Zorin | Sì | Sì (Debian 12 e Ubuntu 22.04: Python troppo vecchio, usa `uv`) |
+| Fedora | Fedora 45 e 44 (Workstation, KDE), Nobara, Bazzite | Sì | Sì |
 | Red Hat | RHEL, AlmaLinux, Rocky 10 | Sì | Sì |
 | Red Hat 9 | RHEL, AlmaLinux, Rocky 9 | **No** (glibc 2.34) | Sì, con `python3.12` |
 | Arch | Arch, Manjaro, EndeavourOS, CachyOS, Garuda | Sì | Sì |
-| openSUSE | Tumbleweed, Leap 15.6+ | Sì | Sì |
+| openSUSE | Tumbleweed, Leap 16.0 e 15.6 | Sì | Sì |
 | Altre | Alpine, Void musl (musl, non glibc) | **No** | Sì |
 
-I pacchetti contengono già Python e Qt: di sistema servono al massimo **FUSE 2** (solo per l'AppImage) e qualche **libreria grafica X11** che su desktop minimali può mancare. Per l'avvio da sorgente le librerie grafiche servono sempre, perché PyQt6 installato con `pip` le prende dal sistema.
+I pacchetti contengono già Python e Qt: di sistema servono al massimo **`fuse3`** (solo per l'AppImage, di solito c'è già) e qualche **libreria grafica X11** che su desktop minimali può mancare. Per l'avvio da sorgente le librerie grafiche servono sempre, perché PyQt6 installato con `pip` le prende dal sistema.
 
 #### Debian, Ubuntu, Linux Mint e derivate
 
-FUSE per l'AppImage (Ubuntu 24.04+, Debian 13+, Mint 22+):
+FUSE per l'AppImage:
 
 ```bash
-sudo apt install libfuse2t64
-```
-
-Su Ubuntu 22.04, Debian 12 e Mint 21 il nome è `libfuse2`:
-
-```bash
-sudo apt install libfuse2
+sudo apt install fuse3
 ```
 
 Librerie grafiche (se compare l'errore sul plugin `xcb`, e sempre per l'avvio da sorgente):
 
 ```bash
-sudo apt install libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+sudo apt install libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1
 ```
 
 Per l'avvio da sorgente servono anche:
@@ -154,11 +161,11 @@ sudo apt install python3-venv git
 #### Fedora
 
 ```bash
-sudo dnf install fuse-libs
+sudo dnf install fuse3
 ```
 
 ```bash
-sudo dnf install mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+sudo dnf install mesa-libEGL mesa-libGL libxcb libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
 ```
 
 Per l'avvio da sorgente (Python con `venv` è già incluso):
@@ -176,7 +183,7 @@ Le **versioni 10** si comportano come Fedora: stessi comandi `dnf` qui sopra.
 Le **versioni 9** hanno glibc 2.34, più vecchia della 2.35 richiesta: AppImage e tar.gz **non partono** (errore `GLIBC_2.35 not found`). Si usa l'avvio da sorgente con Python 3.12 (disponibile dalla 9.4):
 
 ```bash
-sudo dnf install python3.12 git mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+sudo dnf install python3.12 git mesa-libEGL mesa-libGL libxcb libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
 ```
 
 Se `xcb-util-cursor` non viene trovato, attiva EPEL (`sudo dnf install epel-release`) e riprova. Nei comandi di [avvio da sorgente](#avvio-da-sorgente-su-linux) scrivi `python3.12` al posto di `python3`.
@@ -184,11 +191,11 @@ Se `xcb-util-cursor` non viene trovato, attiva EPEL (`sudo dnf install epel-rele
 #### Arch Linux, Manjaro, EndeavourOS, CachyOS
 
 ```bash
-sudo pacman -S --needed fuse2
+sudo pacman -S --needed fuse3
 ```
 
 ```bash
-sudo pacman -S --needed libglvnd libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+sudo pacman -S --needed libglvnd libxcb libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
 ```
 
 Per l'avvio da sorgente:
@@ -202,14 +209,14 @@ Arch non permette `pip install` nel Python di sistema (PEP 668): l'ambiente virt
 #### openSUSE Tumbleweed e Leap
 
 ```bash
-sudo zypper install fuse libfuse2
+sudo zypper install fuse3
 ```
 
 ```bash
-sudo zypper install libEGL1 libGL1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+sudo zypper install libEGL1 libGL1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1
 ```
 
-Per l'avvio da sorgente su Tumbleweed:
+Per l'avvio da sorgente su Tumbleweed e Leap 16:
 
 ```bash
 sudo zypper install python3 python3-pip git
@@ -244,7 +251,7 @@ python3 -m venv .venv
 ```
 
 ```bash
-.venv/bin/pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
+.venv/bin/pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi tzdata
 ```
 
 ```bash
@@ -264,7 +271,7 @@ uv venv --python 3.13 .venv
 ```
 
 ```bash
-uv pip install --python .venv PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
+uv pip install --python .venv PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi tzdata
 ```
 
 Poi si avvia come sopra, con `.venv/bin/python P7MReader.py`.
@@ -367,7 +374,7 @@ Interfaccia pensata secondo le **WCAG 2.1 livello AA**, senza cambiare l'aspetto
 Richiede **Python 3.12+** (testato con 3.13 e 3.15). Su Linux segui la guida [avvio da sorgente su Linux](#avvio-da-sorgente-su-linux), con i pacchetti di sistema per ogni distribuzione.
 
 ```bash
-pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
+pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi tzdata
 ```
 
 ```bash

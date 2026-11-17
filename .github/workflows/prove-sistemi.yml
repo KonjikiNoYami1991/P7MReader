@@ -1,0 +1,134 @@
+name: Prove sui sistemi
+
+# Compila P7MReader (stesso workflow delle release) e prova i pacchetti sui sistemi desktop:
+# - Linux: un container per distribuzione, con i pacchetti di sistema indicati nel README
+#   (packaging/prova-distro.sh): tar.gz, AppImage montata con FUSE, avvio da sorgente
+# - Windows Server 2025, macOS 26 (Apple Silicon e Intel), Ubuntu 26.04: selftest degli eseguibili
+# I container servono solo a simulare le distribuzioni: P7MReader e' un programma desktop.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]   # tutti i branch, non i tag
+    paths:
+      - "P7MReader.py"
+      - "P7MReader.spec"
+      - "traduzioni_en.py"
+      - "build_p7mreader.sh"
+      - "packaging/**"
+      - "README.md"
+      - "README.en.md"
+      - ".github/workflows/**"
+  schedule:
+    # ogni lunedi': le distribuzioni cambiano pacchetti anche senza commit nel repository
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: write   # richiesto dal workflow Build riusato; qui il suo job "release" non parte
+
+concurrency:
+  group: prove-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  linux:
+    needs: build
+    name: ${{ matrix.immagine }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: ${{ matrix.immagine }}
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
+    strategy:
+      fail-fast: false
+      matrix:
+        immagine:
+          # ultime release
+          - ubuntu:26.10
+          - ubuntu:26.04
+          - debian:13
+          - fedora:45
+          - archlinux:latest
+          - opensuse/tumbleweed:latest
+          - opensuse/leap:16.0
+          - almalinux:10
+          - rockylinux/rockylinux:10
+          # release precedenti ancora supportate
+          - ubuntu:24.04
+          - ubuntu:22.04
+          - debian:12
+          - fedora:44
+          - opensuse/leap:15.6
+          - rockylinux/rockylinux:9   # glibc 2.34: si verifica che i pacchetti NON partano e che il sorgente si'
+    steps:
+      - name: Strumenti minimi del container (git, tar)
+        shell: sh
+        run: |
+          if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git tar gzip ca-certificates
+          elif command -v dnf >/dev/null; then dnf install -y -q git tar gzip
+          elif command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed git tar gzip
+          elif command -v zypper >/dev/null; then zypper -n -q install git tar gzip
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: P7MReader-linux-x86_64
+          path: pacchetti
+
+      - name: Prova (pacchetti di sistema del README, tar.gz, AppImage, sorgente)
+        shell: bash
+        run: bash packaging/prova-distro.sh "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/pacchetti"
+
+  desktop:
+    needs: build
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            pacchetto: windows-x64
+          - os: macos-26
+            pacchetto: macos-arm64
+          - os: macos-26-intel
+            pacchetto: macos-x86_64
+          - os: ubuntu-26.04
+            pacchetto: linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: P7MReader-${{ matrix.pacchetto }}
+          path: pacchetti
+
+      - name: Selftest (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem pacchetti/*.exe | Select-Object -First 1
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList '--selftest' -Wait -PassThru
+          Get-Content "$env:APPDATA/P7MReader/errori.log" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "Selftest fallito (codice $($p.ExitCode))" }
+
+      - name: Selftest (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sw_vers
+          dmg="$(ls pacchetti/*.dmg | head -1)"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint /Volumes/P7MReader
+          cp -R /Volumes/P7MReader/P7MReader.app "$RUNNER_TEMP/"
+          hdiutil detach /Volumes/P7MReader
+          codesign --verify --deep "$RUNNER_TEMP/P7MReader.app" && echo "Firma ad-hoc integra"
+          QT_QPA_PLATFORM=offscreen "$RUNNER_TEMP/P7MReader.app/Contents/MacOS/P7MReader" --selftest \
+            || { cat ~/.config/P7MReader/errori.log 2>/dev/null; exit 1; }
+
+      - name: Prova su macchina virtuale vera (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo bash packaging/prova-distro.sh "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/pacchetti"

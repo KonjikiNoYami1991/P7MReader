@@ -23,7 +23,8 @@ if IS_WIN:
     if os.path.exists(dll):
         binaries.append((dll, "."))
 hiddenimports = ["PyQt6.QtSvg", "traduzioni_en"]
-for pacchetto in ("pyhanko", "pyhanko_certvalidator", "asn1crypto", "lxml"):
+# tzdata: pyhanko legge il fuso Europe/Brussels all'import; incluso cosi' non dipende da /usr/share/zoneinfo
+for pacchetto in ("pyhanko", "pyhanko_certvalidator", "asn1crypto", "lxml", "tzdata"):
     d, b, h = collect_all(pacchetto)
     datas += d
     binaries += b
