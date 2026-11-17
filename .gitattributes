@@ -1,0 +1,9 @@
+*.sh text eol=lf
+packaging/AppRun text eol=lf
+*.desktop text eol=lf
+*.py text eol=lf
+*.bat text eol=crlf
+*.ico binary
+*.icns binary
+*.png binary
+TSL-IT.xml binary

@@ -1,8 +1,27 @@
 """
-P7MReader 3.0 - Verifica firme digitali ed estrazione documenti
+P7MReader 3.1 - Verifica firme digitali ed estrazione documenti
 Supporto: CAdES (.p7m, .p7s, anche annidati / base64), PAdES (.pdf), XAdES (.xml, fatture elettroniche)
 
-Novita' rispetto alla 2.0
+Uso:    python P7MReader.py [file o cartelle...]      python P7MReader.py --selftest
+Build:  build_p7mreader.bat  (PyInstaller, P7MReader.spec)
+Dipendenze: PyQt6, pyhanko, pyhanko-certvalidator, asn1crypto, cryptography, lxml
+
+Changelog
+3.1 (2026-11-17)
+- Aggiunto: interfaccia in inglese, usata automaticamente se Windows non e' in italiano (scelta anche in Impostazioni)
+- Aggiunto: Trusted List AgID verificata come fonte autentica: firma XAdES della lista controllata e firmatario
+  confrontato con i certificati pubblicati dalla Commissione europea nella List of Trusted Lists (LOTL)
+- Aggiunto: stato del certificatore alla data della firma (storico ServiceHistory), qualificazioni eIDAS
+  (QSCD, firma/sigillo, Qualifications e criteri di policy) e controllo "Qualificazione eIDAS" (QES, AdES/QC...)
+- Aggiunto: marche temporali qualificate riconosciute (servizi TSA/QTST); controllo dell'uso della chiave
+- Corretto: i servizi TSA/TSS-QC della lista non erano caricati come radici attendibili per le marche temporali
+- Corretto: il certificatore si riconosce anche per chiave/SKI (certificati CA rinnovati), non solo per impronta
+- Aggiunto: accessibilita' (WCAG 2.1 AA): focus visibile da tastiera, nomi accessibili per lettori di schermo,
+  contrasti portati ad almeno 4.5:1, testo che segue la dimensione scelta in Windows, animazioni disattivabili,
+  scorciatoie (Ctrl+O, Ctrl+Maiusc+O, Ctrl+F, Ctrl+1..4, Invio/Spazio per espandere, tasto Menu)
+- Aggiunto: --selftest per gli automatismi di build
+
+3.0
 - Interfaccia a schede (Inizio, Verifica, Estrazione, Impostazioni) in PyQt6, con 3 temi
 - Tabella unica per verifica ed estrazione massiva, con dettagli espandibili: per ogni firma l'elenco dei controlli
 - Marca temporale verificata davvero (impronta, firma, TSA): se e' valida la firma si valuta a quella data
@@ -26,7 +45,6 @@ import logging
 import math
 import time
 import base64
-import queue
 import hashlib
 import asyncio
 import zipfile
@@ -44,7 +62,7 @@ from typing import List, Optional, Tuple
 from PyQt6 import sip
 from PyQt6.QtCore import Qt, QObject, QThread, QTimer, QSize, QRectF, QPointF, QByteArray, pyqtSignal
 from PyQt6.QtGui import (QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF, QLinearGradient, QGuiApplication,
-                         QAction, QKeySequence, QShortcut)
+                         QKeySequence, QShortcut)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton,
                              QLabel, QLineEdit, QFrame, QTabWidget, QScrollArea, QStackedWidget, QTreeWidget,
                              QTreeWidgetItem, QStyledItemDelegate, QHeaderView, QAbstractItemView, QProgressBar,
@@ -52,6 +70,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QMenu, QButtonGroup, QSizePolicy, QTextBrowser)
 
 from asn1crypto import cms, x509, pem, tsp
+from asn1crypto import core as asn1core
 from asn1crypto.core import Void
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko_certvalidator import CertificateValidator, ValidationContext
@@ -72,7 +91,7 @@ except ImportError:
 
 try:
     from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa, dsa, ed25519, ed448
+    from cryptography.hazmat.primitives.asymmetric import padding, ec
     from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
     from cryptography.exceptions import InvalidSignature
     HAS_CRYPTO = True
@@ -88,7 +107,7 @@ for _nome_log in ("pyhanko", "pyhanko_certvalidator"):      # gli esiti li gesti
     logging.getLogger(_nome_log).setLevel(logging.CRITICAL)
 
 APP_NAME = "P7MReader"
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 ESTENSIONI_VERIFICA = ('.p7m', '.p7s', '.pdf', '.xml')
 ESTENSIONI_ESTRAI = ('.p7m',)
 MAX_ANNIDAMENTO = 6
@@ -122,6 +141,8 @@ class Impostazioni:
         "verifica_in_estrazione": True, # durante l'estrazione verifica anche le firme
         "colonne_verifica": "",        # larghezze colonne salvate
         "colonne_estrai": "",
+        "lingua": "auto",              # auto (segue Windows) / it / en
+        "animazioni": True,            # animazioni della zona di rilascio (spente anche se Windows le disattiva)
     }
 
     def __init__(self):
@@ -140,9 +161,10 @@ class Impostazioni:
             pass
 
     def salva(self):
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
+        try:                           # scrittura atomica: un crash a meta' non corrompe le impostazioni
+            with open(self.path + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(self.d, f, indent=2, ensure_ascii=False)
+            os.replace(self.path + ".tmp", self.path)
         except Exception:
             pass
 
@@ -154,6 +176,40 @@ class Impostazioni:
 
 
 IMP = Impostazioni()
+
+
+# ============================================================ LINGUA
+def lingua_sistema() -> str:
+    """'it' se l'interfaccia del sistema e' in italiano, altrimenti 'en'."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return "it" if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x10 else "en"
+        except Exception:
+            pass
+    import locale
+    for v in (os.environ.get("LC_ALL"), os.environ.get("LC_MESSAGES"), os.environ.get("LANG")):
+        if v and v not in ("C", "POSIX"):
+            return "it" if v.lower().startswith("it") else "en"
+    try:
+        return "it" if (locale.getlocale()[0] or "").lower().startswith("it") else "en"
+    except Exception:
+        return "en"
+
+
+LINGUA = os.environ.get("P7MREADER_LANG") or (IMP["lingua"] if IMP["lingua"] in ("it", "en") else lingua_sistema())
+if LINGUA not in ("it", "en"):
+    LINGUA = "en"
+if LINGUA == "en":
+    from traduzioni_en import EN as _TRADUZIONI
+else:
+    _TRADUZIONI = {}
+
+
+def T(testo: str, **valori) -> str:
+    """Testo nella lingua dell'interfaccia. La chiave e' sempre il testo italiano; i {segnaposto} si riempiono con valori."""
+    s = _TRADUZIONI.get(testo, testo)
+    return s.format(**valori) if valori else s
 
 
 # ============================================================ UTILITA'
@@ -191,7 +247,7 @@ def pulisci_nome_file_globale(filename: str) -> str:
             continue
         break
     if nome.lower() in _EST_BUSTA:
-        return "documento"
+        return T("documento")
     while _estensione_vera(nome):
         base, ext = os.path.splitext(nome)
         pulita = _togli_segni_copia(base)
@@ -202,7 +258,7 @@ def pulisci_nome_file_globale(filename: str) -> str:
             continue
         nome = pulita + ext
         break
-    return nome or "documento"
+    return nome or T("documento")
 
 
 def tipo_documento(nome: str) -> str:
@@ -315,33 +371,29 @@ def dt_locale(dt):
         return dt
 
 
+FORMATO_DATA = "%d/%m/%Y" if LINGUA == "it" else "%Y-%m-%d"
+
+
 def fmt_data(dt) -> str:
     d = dt_locale(dt)
-    return d.strftime("%d/%m/%Y") if d else "N/D"
+    return d.strftime(FORMATO_DATA) if d else T("N/D")
 
 
 def fmt_ora(dt) -> str:
     d = dt_locale(dt)
     if not d:
-        return "N/D"
+        return T("N/D")
     off = d.strftime("%z")
     sfx = f" (UTC{off[:3]}:{off[3:]})" if off else ""
     return d.strftime("%H:%M:%S") + sfx
 
 
 def fmt_dt(dt) -> str:
-    return f"{fmt_data(dt)} {fmt_ora(dt)}" if dt else "N/D"
+    return f"{fmt_data(dt)} {fmt_ora(dt)}" if dt else T("N/D")
 
 
 def tronca(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
-
-
-def data_italiana() -> str:
-    mesi = ["GEN", "FEB", "MAR", "APR", "MAG", "GIU", "LUG", "AGO", "SET", "OTT", "NOV", "DIC"]
-    giorni = ["LUNEDÌ", "MARTEDÌ", "MERCOLEDÌ", "GIOVEDÌ", "VENERDÌ", "SABATO", "DOMENICA"]
-    o = datetime.datetime.now()
-    return f"{giorni[o.weekday()]} {o.day} {mesi[o.month - 1]} {o.year}"
 
 
 def parse_pdf_date(s) -> Optional[datetime.datetime]:
@@ -422,14 +474,15 @@ class Controllo:
     nome: str
     stato: str                        # ok / warn / error / none (solo informativo)
     dettaglio: str = ""
+    codice: str = ""                   # identificativo interno (indipendente dalla lingua): tl, qualificazione...
 
 
 @dataclass
 class FirmaInfo:
-    tipo: str = "Firma"
+    tipo: str = "Firma"               # codice interno (Firma / Controfirma / Marca temporale del documento): si traduce in vista
     formato: str = ""
     livello: int = 0
-    firmatario: str = "Sconosciuto"
+    firmatario: str = T("Sconosciuto")
     identificativo: str = ""
     organizzazione: str = ""
     emittente: str = ""
@@ -485,34 +538,51 @@ class RisultatoDoc:
         if self.errore:
             self.stato, self.esito = "error", self.errore
         elif not self.firme:
-            self.stato, self.esito = "none", "Nessuna firma digitale presente"
+            self.stato, self.esito = "none", T("Nessuna firma digitale presente")
         elif not self.verificato:
-            self.stato, self.esito = "none", "Verifica non eseguita (solo estrazione)"
+            self.stato, self.esito = "none", T("Verifica non eseguita (solo estrazione)")
         else:
             peggiore = max(self.firme, key=lambda f: ORDINE_STATO.get(f.stato, 0))
             self.stato, self.esito = peggiore.stato, peggiore.esito
 
 
-ETICHETTA = {"ok": "Verificato", "warn": "Attenzione", "error": "Non valido", "none": "Senza firma"}
-ETICHETTA_ESTRAZIONE = {"ok": "Estratto", "duplicato": "Già presente", "permessi": "Permessi negati", "errore": "Fallito",
-                        "": "—"}
+ETICHETTA = {"ok": T("Verificato"), "warn": T("Attenzione"), "error": T("Non valido"), "none": T("Senza firma")}
+ETICHETTA_ESTRAZIONE = {"ok": T("Estratto"), "duplicato": T("Già presente"), "permessi": T("Permessi negati"),
+                        "errore": T("Fallito"), "": "—"}
+
+
+# come lo dice un lettore di schermo (al posto dei simboli colorati)
+STATO_CONTROLLO = {"ok": T("superato"), "warn": T("attenzione"), "error": T("non superato"), "none": T("informativo")}
 
 
 def etichetta_doc(r: RisultatoDoc) -> str:
-    return "Non verificato" if (r.stato == "none" and r.firme) else ETICHETTA[r.stato]
+    return T("Non verificato") if (r.stato == "none" and r.firme) else ETICHETTA[r.stato]
 
 
 def etichetta_firma(f: FirmaInfo) -> str:
-    return "Non verificata" if f.stato == "none" else ETICHETTA[f.stato]
+    return T("Non verificata") if f.stato == "none" else ETICHETTA[f.stato]
 
 
 # ============================================================ ARCHIVIO DI FIDUCIA
-# Trusted List italiana (AgID, eIDAS): l'elenco ufficiale dei certificatori qualificati e' la fonte giusta per
-# le radici delle firme. Si riscarica a ogni avvio (se c'e' connessione) e si tiene in cache; offline si usa
-# l'ultima copia scaricata, altrimenti il TSL-IT.xml distribuito accanto al programma o incluso nell'exe.
+# Trusted List italiana (AgID, eIDAS): l'elenco ufficiale dei prestatori qualificati e' la fonte giusta per le radici
+# delle firme. Si riscarica a ogni avvio (se c'e' connessione) e si tiene in cache; offline si usa l'ultima copia
+# scaricata, altrimenti il TSL-IT.xml distribuito accanto al programma o incluso nell'exe.
+# Ogni copia si accetta solo se la sua firma XAdES e' integra; il firmatario si confronta con i certificati che la
+# Commissione europea pubblica per l'Italia nella List of Trusted Lists (LOTL): cosi' una lista contraffatta non passa.
 URL_TSL = "https://eidas.agid.gov.it/TL/TSL-IT.xml"
-_TSL_TIPI_FIDUCIA = {"CA/QC", "CA/PKC", "TSA/QTST", "TSA"}
-_TSL_STATI_RITIRATI = {"withdrawn", "deprecatedatnationallevel"}
+URL_LOTL = "https://ec.europa.eu/tools/lotl/eu-lotl.xml"
+_TSL_TIPI_TSA = {"TSA", "TSA/QTST", "TSA/TSS-QC", "TSA/TSS-AdESQCandQES"}
+_TSL_TIPI_FIDUCIA = {"CA/QC", "CA/PKC"} | _TSL_TIPI_TSA
+# stati in cui il servizio e' attivo: "granted" con eIDAS (dal 1/7/2016), i vecchi stati della direttiva 1999/93 prima
+_STATI_ATTIVI = {"granted", "recognisedatnationallevel", "undersupervision", "accredited", "supervisionincessation"}
+_INIZIO_EIDAS = datetime.datetime(2016, 7, 1, tzinfo=datetime.timezone.utc)
+_DATA_MINIMA = datetime.datetime(1900, 1, 1, tzinfo=datetime.timezone.utc)
+STATI_TL = {"granted": T("qualificato"), "withdrawn": T("ritirato"), "accredited": T("accreditato"),
+            "undersupervision": T("sotto vigilanza"), "supervisionincessation": T("vigilanza in cessazione"),
+            "supervisionceased": T("vigilanza cessata"), "supervisionrevoked": T("vigilanza revocata"),
+            "accreditationceased": T("accreditamento cessato"), "accreditationrevoked": T("accreditamento revocato"),
+            "recognisedatnationallevel": T("riconosciuto a livello nazionale"),
+            "deprecatedatnationallevel": T("dismesso a livello nazionale")}
 
 
 def _percorso_cache_tsl() -> str:
@@ -528,76 +598,295 @@ def _tag_locale(tag) -> str:
     return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else ""
 
 
+def _figlio_tl(el, nome):
+    if el is None:
+        return None
+    return next((c for c in el if _tag_locale(c.tag) == nome), None)
+
+
+def _figli_tl(el, nome) -> list:
+    return [c for c in el if _tag_locale(c.tag) == nome] if el is not None else []
+
+
+def _testo_tl(el) -> str:
+    return (el.text or "").strip() if el is not None else ""
+
+
+def _ultimo_pezzo(uri: str) -> str:
+    return uri.strip().rstrip("/#").rsplit("/", 1)[-1]
+
+
+def _primo_nome(el) -> str:
+    """Primo <Name> di un elemento multilingue, preferendo la lingua dell'interfaccia."""
+    nomi = _figli_tl(el, "Name")
+    for c in nomi:
+        if c.get("{http://www.w3.org/XML/1998/namespace}lang", "") == LINGUA:
+            return _testo_tl(c)
+    return _testo_tl(nomi[0]) if nomi else ""
+
+
+def _impronta_chiave(c) -> str:
+    return hashlib.sha256(c['tbs_certificate']['subject_public_key_info'].dump()).hexdigest()
+
+
+def _identificativi_chiave(c) -> set:
+    """SKI dichiarato e SHA-1 della chiave pubblica (RFC 5280, metodo 1): quello che compare negli AKI dei figli."""
+    out = set()
+    for f in (lambda: c.key_identifier, lambda: c.public_key.sha1):
+        try:
+            v = f()
+            if v:
+                out.add(bytes(v))
+        except Exception:
+            pass
+    return out
+
+
+@dataclass
+class IstanzaServizio:
+    """Uno stato del servizio nel tempo (ServiceInformation o ServiceHistoryInstance)."""
+    inizio: Optional[datetime.datetime]
+    stato: str
+    tipo: str
+    ambito: set = field(default_factory=set)                 # AdditionalServiceInformation: ForeSignatures, ForeSeals...
+    qualificazioni: list = field(default_factory=list)       # [(qualificatori, CriteriaList)]
+
+
+@dataclass
+class ServizioTSL:
+    tipo: str
+    nome: str
+    tsp: str
+    certificati: list
+    ski: set
+    chiavi: set
+    storia: List[IstanzaServizio]                            # dalla piu' recente
+
+    def istanza_a(self, quando) -> Optional[IstanzaServizio]:
+        """Lo stato in vigore a una certa data (None se il servizio non era ancora in lista)."""
+        if quando is None:
+            return self.storia[0] if self.storia else None
+        if quando.tzinfo is None:
+            quando = quando.replace(tzinfo=datetime.timezone.utc)
+        return next((i for i in self.storia if (i.inizio or _DATA_MINIMA) <= quando), None)
+
+    @property
+    def nome_breve(self) -> str:
+        m = re.search(r'(?:^|,)\s*CN=([^,]+)', self.nome)
+        return (m.group(1) if m else self.nome).strip() or self.tsp
+
+
+def _leggi_istanza(nodo):
+    tipo = _testo_tl(_figlio_tl(nodo, "ServiceTypeIdentifier")).split("/Svctype/")[-1]
+    ist = IstanzaServizio(inizio=parse_iso(_testo_tl(_figlio_tl(nodo, "StatusStartingTime"))),
+                          stato=_ultimo_pezzo(_testo_tl(_figlio_tl(nodo, "ServiceStatus"))), tipo=tipo)
+    certificati, ski = [], set()
+    sdi = _figlio_tl(nodo, "ServiceDigitalIdentity")
+    for e in (sdi.iter() if sdi is not None else []):
+        nome = _tag_locale(e.tag)
+        try:
+            if nome == "X509Certificate" and e.text:
+                certificati.append(x509.Certificate.load(base64.b64decode("".join(e.text.split()))))
+            elif nome == "X509SKI" and e.text:
+                ski.add(base64.b64decode("".join(e.text.split())))
+        except Exception:
+            pass
+    est = _figlio_tl(nodo, "ServiceInformationExtensions")
+    for e in (est.iter() if est is not None else []):
+        nome = _tag_locale(e.tag)
+        if nome == "AdditionalServiceInformation":
+            uri = _testo_tl(_figlio_tl(e, "URI"))
+            if uri:
+                ist.ambito.add(_ultimo_pezzo(uri))
+        elif nome == "QualificationElement":
+            qualificatori = {_ultimo_pezzo(q.get("uri", "")) for q in e.iter() if _tag_locale(q.tag) == "Qualifier" and q.get("uri")}
+            ist.qualificazioni.append((qualificatori, _figlio_tl(e, "CriteriaList")))
+    return tipo, _primo_nome(_figlio_tl(nodo, "ServiceName")), certificati, ski, ist
+
+
 def leggi_tsl(dati: bytes):
-    """Certificati dei servizi CA/TSA della Trusted List: [(certificato, tipo servizio, data ritiro o None)], descrizione.
+    """Servizi della Trusted List con tutto lo storico, piu' i metadati della lista.
     Solleva un'eccezione se il file non e' una Trusted List con certificati (download troncato, pagina di errore...)."""
     radice = ET.fromstring(dati)
     if _tag_locale(radice.tag) != "TrustServiceStatusList":
         raise ValueError("non e' una Trusted List")
-    numero = emessa = ""
-    for e in radice.iter():
-        nome = _tag_locale(e.tag)
-        if nome == "TSLSequenceNumber" and not numero:
-            numero = (e.text or "").strip()
-        elif nome == "ListIssueDateTime" and not emessa:
-            emessa = (e.text or "").strip()
-    certificati = []
-    for info in radice.iter():
-        if _tag_locale(info.tag) != "ServiceInformation":
+    schema = _figlio_tl(radice, "SchemeInformation")
+    meta = {"numero": _testo_tl(_figlio_tl(schema, "TSLSequenceNumber")),
+            "emessa": parse_iso(_testo_tl(_figlio_tl(schema, "ListIssueDateTime"))),
+            "prossima": parse_iso(_testo_tl(_figlio_tl(_figlio_tl(schema, "NextUpdate"), "dateTime")))}
+    servizi = []
+    for prestatore in radice.iter():
+        if _tag_locale(prestatore.tag) != "TrustServiceProvider":
             continue
-        tipo = stato = inizio = ""
-        for c in info:
-            nome = _tag_locale(c.tag)
-            if nome == "ServiceTypeIdentifier":
-                tipo = (c.text or "").strip().split("/Svctype/")[-1]
-            elif nome == "ServiceStatus":
-                stato = (c.text or "").strip().rsplit("/", 1)[-1]
-            elif nome == "StatusStartingTime":
-                inizio = (c.text or "").strip()
-        if tipo not in _TSL_TIPI_FIDUCIA:
+        nome_tsp = _primo_nome(_figlio_tl(_figlio_tl(prestatore, "TSPInformation"), "TSPName"))
+        for srv in _figli_tl(_figlio_tl(prestatore, "TSPServices"), "TSPService"):
+            info = _figlio_tl(srv, "ServiceInformation")
+            if info is None:
+                continue
+            tipo, nome, certificati, ski, ist = _leggi_istanza(info)
+            storia = [ist]
+            for h in _figli_tl(_figlio_tl(srv, "ServiceHistory"), "ServiceHistoryInstance"):
+                _t, _n, c2, s2, ist2 = _leggi_istanza(h)
+                certificati += c2
+                ski |= s2
+                storia.append(ist2)
+            storia.sort(key=lambda i: i.inizio or _DATA_MINIMA, reverse=True)
+            chiavi = set()
+            for c in certificati:
+                ski |= _identificativi_chiave(c)
+                chiavi.add(_impronta_chiave(c))
+            servizi.append(ServizioTSL(tipo, nome, nome_tsp, certificati, ski, chiavi, storia))
+    if not any(s.certificati for s in servizi):
+        raise ValueError("Trusted List senza certificati")
+    return servizi, meta
+
+
+def _firma_lista_xml(dati: bytes):
+    """Verifica la firma XAdES enveloped di una Trusted List o della LOTL. -> (esito, messaggio, certificato firmatario)"""
+    if etree is None or not HAS_CRYPTO:
+        return None, T("librerie lxml/cryptography non disponibili"), None
+    radice = etree.fromstring(dati, _parser_xml())
+    firma = next((c for c in radice if isinstance(c.tag, str) and c.tag == _DS + "Signature"), None)
+    if firma is None:
+        return False, T("la lista non è firmata"), None
+    cert = None
+    for e in firma.iter(_DS + "X509Certificate"):
+        try:
+            cert = x509.Certificate.load(base64.b64decode("".join((e.text or "").split())))
+            break
+        except Exception:
             continue
-        ritiro = parse_iso(inizio) if stato in _TSL_STATI_RITIRATI else None
-        for e in info.iter():
+    if cert is None:
+        return None, T("certificato del firmatario assente"), None
+    esito, msg, copre = verifica_xmldsig(firma, radice, dati, cert)
+    if esito and not copre:
+        return False, T("la firma non copre l'intera lista"), cert
+    return esito, msg, cert
+
+
+def _scarica_url(url: str, timeout: int = 20) -> bytes:
+    req = urllib.request.Request(url, headers={'User-Agent': f'{APP_NAME}/{APP_VERSION}'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(50 * 1024 * 1024)
+
+
+def _scrivi_atomico(percorso: str, dati: bytes):
+    try:
+        os.makedirs(os.path.dirname(percorso), exist_ok=True)
+        with open(percorso + ".tmp", "wb") as f:
+            f.write(dati)
+        os.replace(percorso + ".tmp", percorso)
+    except Exception:
+        pass
+
+
+def certificati_lotl_italia(dati: bytes) -> set:
+    """Impronte SHA-256 dei certificati con cui AgID puo' firmare la Trusted List, secondo la LOTL della Commissione."""
+    radice = ET.fromstring(dati)
+    out = set()
+    for ptr in radice.iter():
+        if _tag_locale(ptr.tag) != "OtherTSLPointer":
+            continue
+        territorio = next((_testo_tl(e) for e in ptr.iter() if _tag_locale(e.tag) == "SchemeTerritory"), "")
+        if territorio != "IT":
+            continue
+        for e in ptr.iter():
             if _tag_locale(e.tag) == "X509Certificate" and e.text:
                 try:
-                    certificati.append((x509.Certificate.load(base64.b64decode("".join(e.text.split()))), tipo, ritiro))
+                    out.add(hashlib.sha256(base64.b64decode("".join(e.text.split()))).hexdigest())
                 except Exception:
                     pass
-    if not certificati:
-        raise ValueError("Trusted List senza certificati")
-    d = parse_iso(emessa)
-    return certificati, f"Trusted List AgID n. {numero or '?'} del {fmt_data(d) if d else emessa or '?'}"
+    return out
+
+
+def carica_lotl(online: bool) -> Optional[set]:
+    """Certificati dei firmatari della lista italiana secondo la LOTL UE (scaricata o in cache); None se non disponibile."""
+    cache = os.path.join(cartella_config(), "eu-lotl.xml")
+    fonti = []
+    if online:
+        try:
+            fonti.append(("rete", _scarica_url(URL_LOTL)))
+        except Exception:
+            pass
+    try:
+        with open(cache, "rb") as f:
+            fonti.append(("cache", f.read()))
+    except Exception:
+        pass
+    for origine, dati in fonti:
+        try:
+            if _firma_lista_xml(dati)[0] is False:      # LOTL alterata: si ignora
+                continue
+            certificati = certificati_lotl_italia(dati)
+            if not certificati:
+                continue
+            if origine == "rete":
+                _scrivi_atomico(cache, dati)
+            return certificati
+        except Exception:
+            continue
+    return None
+
+
+def autenticita_tsl(dati: bytes, firmatari_lotl: Optional[set]) -> Tuple[str, str]:
+    """-> (codice, descrizione). codice: ok / non_autenticata (LOTL assente o firma non verificabile) /
+    firmatario_ignoto (firma integra ma firmatario non nella LOTL) / alterata (firma non valida)."""
+    try:
+        esito, msg, firmatario = _firma_lista_xml(dati)
+    except Exception as e:
+        esito, msg, firmatario = None, type(e).__name__, None
+    if esito is False:
+        return "alterata", T("firma della lista NON valida: {msg}", msg=msg)
+    if esito is None or firmatario is None:
+        return "non_autenticata", T("firma della lista non verificabile ({msg})", msg=msg)
+    chi = _get(firmatario.subject, 'common_name') or _get(firmatario.subject, 'organization_name')
+    if firmatari_lotl is None:
+        return "non_autenticata", T("firma integra di «{chi}», non confrontata con la LOTL UE (non disponibile)", chi=chi)
+    if hashlib.sha256(firmatario.dump()).hexdigest() in firmatari_lotl:
+        return "ok", T("firma verificata: «{chi}», autorizzato dalla LOTL della Commissione UE", chi=chi)
+    return "firmatario_ignoto", T("firma integra ma il firmatario «{chi}» non è tra quelli indicati dalla LOTL UE", chi=chi)
+
+
+def _descrivi_tsl(meta: dict, origine: str) -> str:
+    testo = T("Trusted List AgID n. {numero} del {data}", numero=meta.get("numero") or "?",
+              data=fmt_data(meta["emessa"]) if meta.get("emessa") else "?")
+    prossima = meta.get("prossima")
+    if prossima and prossima < datetime.datetime.now(datetime.timezone.utc):
+        testo += " · " + T("SCADUTA il {data}", data=fmt_data(prossima))
+    return f"{testo} ({origine})"
 
 
 def carica_tsl(online: bool):
     """Scarica la Trusted List AgID (e aggiorna la cache); senza rete, o con online=False, usa la cache
-    o la copia distribuita."""
+    o la copia distribuita. -> (servizi, metadati, descrizione breve, dettaglio sull'autenticita')"""
     cache = _percorso_cache_tsl()
+    firmatari = carica_lotl(online)
+    rifiuti = []
     if online:
         try:
-            req = urllib.request.Request(URL_TSL, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                dati = r.read()
-            certificati, descr = leggi_tsl(dati)
-            try:
-                os.makedirs(os.path.dirname(cache), exist_ok=True)
-                with open(cache + ".tmp", "wb") as f:
-                    f.write(dati)
-                os.replace(cache + ".tmp", cache)
-            except Exception:
-                pass
-            return certificati, descr + " (aggiornata online)"
+            dati = _scarica_url(URL_TSL)
+            servizi, meta = leggi_tsl(dati)
+            codice, autenticita = autenticita_tsl(dati, firmatari)
+            if codice in ("ok", "non_autenticata"):
+                _scrivi_atomico(cache, dati)
+                return servizi, meta, _descrivi_tsl(meta, T("aggiornata online")), autenticita
+            rifiuti.append(T("copia scaricata scartata: {motivo}", motivo=autenticita))
         except Exception:
             pass
-    motivo = "rete non disponibile" if online else "aggiornamento online in corso"
-    for percorso, origine in [(cache, "copia in cache")] + [(p, "copia distribuita") for p in _percorsi_tsl_distribuita()]:
+    motivo = T("rete non disponibile") if online else T("aggiornamento online in corso")
+    for percorso, origine in [(cache, T("copia in cache"))] + [(p, T("copia distribuita")) for p in _percorsi_tsl_distribuita()]:
         try:
             with open(percorso, "rb") as f:
-                certificati, descr = leggi_tsl(f.read())
-            return certificati, f"{descr} ({origine}, {motivo})"
+                dati = f.read()
+            servizi, meta = leggi_tsl(dati)
+            codice, autenticita = autenticita_tsl(dati, firmatari)
+            if codice == "alterata":                   # una copia locale manomessa non si usa mai
+                rifiuti.append(f"{origine}: {autenticita}")
+                continue
+            return servizi, meta, _descrivi_tsl(meta, f"{origine}, {motivo}"), "\n".join([autenticita] + rifiuti)
         except Exception:
             continue
-    return [], "Trusted List AgID non disponibile (nessuna rete e nessuna copia locale)"
+    return [], {}, T("Trusted List AgID non disponibile (nessuna rete e nessuna copia locale valida)"), "\n".join(rifiuti)
 
 
 class ArchivioFiducia:
@@ -608,8 +897,11 @@ class ArchivioFiducia:
         self.radici: List[x509.Certificate] = []
         self.intermedi: List[x509.Certificate] = []
         self.hash_radici = set()
-        self.tsl = {}                  # sha256 -> (tipo servizio, data ritiro o None) dei certificati della Trusted List
+        self.servizi: List[ServizioTSL] = []
+        self.per_chiave, self.per_ski = {}, {}         # indici dei servizi della Trusted List
+        self.tsl_meta = {}
         self.tsl_descrizione = ""
+        self.tsl_dettaglio = ""
         self._tsl_letta = None
         self.cache_http = {}
         self.cache_validazione = {}
@@ -635,13 +927,18 @@ class ArchivioFiducia:
     def ricarica(self, scarica_tsl: bool = False):
         """Ricostruisce l'archivio. La Trusted List si scarica solo con scarica_tsl (all'avvio, in sottofondo);
         altrimenti si riusa quella gia' letta o la copia locale, cosi' l'interfaccia non aspetta la rete."""
-        radici, intermedi, tsl = [], [], {}
+        radici, intermedi = [], []
         if scarica_tsl or self._tsl_letta is None:
             self._tsl_letta = carica_tsl(online=scarica_tsl)
-        certificati_tsl, descrizione_tsl = self._tsl_letta
-        for c, tipo, ritiro in certificati_tsl:
-            radici.append(c)
-            tsl[hashlib.sha256(c.dump()).hexdigest()] = (tipo, ritiro)
+        servizi, meta, descrizione, dettaglio = self._tsl_letta
+        per_chiave, per_ski = {}, {}
+        for s in servizi:
+            if s.tipo in _TSL_TIPI_FIDUCIA:
+                radici.extend(s.certificati)
+            for k in s.chiavi:
+                per_chiave.setdefault(k, []).append(s)
+            for k in s.ski:
+                per_ski.setdefault(k, []).append(s)
         if sys.platform == "win32":
             for store, dest in (("ROOT", radici), ("CA", intermedi)):
                 try:
@@ -673,22 +970,43 @@ class ArchivioFiducia:
         with self.lock:
             self.radici, self.intermedi = finali, intermedi
             self.hash_radici = visti
-            self.tsl, self.tsl_descrizione = tsl, descrizione_tsl
+            self.servizi, self.per_chiave, self.per_ski = servizi, per_chiave, per_ski
+            self.tsl_meta, self.tsl_descrizione, self.tsl_dettaglio = meta, descrizione, dettaglio
             self.cache_validazione.clear()
 
-    def ancora_tsl(self, cert, extra):
-        """Primo certificato della catena (il firmatario escluso) presente nella Trusted List, o None."""
+    def _servizi_di(self, c) -> List[ServizioTSL]:
+        out = list(self.per_chiave.get(_impronta_chiave(c), []))
+        for k in _identificativi_chiave(c):
+            out += [s for s in self.per_ski.get(k, []) if s not in out]
+        return out
+
+    def trova_servizi(self, cert, extra, includi_se_stesso=False) -> Tuple[List[ServizioTSL], Optional[x509.Certificate]]:
+        """Servizi della Trusted List che hanno emesso il certificato: si risale la catena e si confronta la chiave
+        (impronta della chiave pubblica o SKI/AKI), cosi' anche un certificato CA rinnovato viene riconosciuto.
+        includi_se_stesso: per le TSA, il cui certificato puo' essere direttamente l'identita' del servizio."""
+        pool = list(extra) + self.intermedi + self.radici
+        if includi_se_stesso:
+            trovati = self._servizi_di(cert)
+            if trovati:
+                return trovati, cert
         corrente = cert
         for _ in range(8):
-            nxt = self._cerca_emittente(corrente, list(extra) + self.intermedi + self.radici)
-            if nxt is None:
-                return None
-            if hashlib.sha256(nxt.dump()).hexdigest() in self.tsl:
-                return nxt
-            if nxt.issuer == nxt.subject:
-                return None
-            corrente = nxt
-        return None
+            emittente = self._cerca_emittente(corrente, pool)
+            try:
+                aki = corrente.authority_key_identifier
+            except Exception:
+                aki = None
+            if aki and bytes(aki) in self.per_ski:
+                return list(self.per_ski[bytes(aki)]), emittente
+            if emittente is None:
+                return [], None
+            trovati = self._servizi_di(emittente)
+            if trovati:
+                return trovati, emittente
+            if emittente.issuer == emittente.subject:
+                return [], None
+            corrente = emittente
+        return [], None
 
     def scarica(self, url: str) -> Optional[bytes]:
         if url in self.cache_http:
@@ -696,9 +1014,7 @@ class ArchivioFiducia:
         dati = None
         if url.lower().startswith(("http://", "https://")):
             try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=6) as r:
-                    dati = r.read()
+                dati = _scarica_url(url, timeout=6)
             except Exception:
                 dati = None
         self.cache_http[url] = dati
@@ -772,8 +1088,6 @@ class ArchivioFiducia:
             corrente = nxt
         return None
 
-
-ARCHIVIO = ArchivioFiducia()
 
 
 # ============================================================ MOTORE: CMS / CERTIFICATI
@@ -937,14 +1251,14 @@ def _verifica_firma_grezza(chiave, firma: bytes, dati: bytes, sig_algo, classe_h
 def verifica_integrita(signer_info, cert, payload: Optional[bytes]) -> Tuple[Optional[bool], str]:
     """Controlla digest del contenuto e firma. (True/False/None, messaggio)"""
     if not HAS_CRYPTO:
-        return None, "libreria 'cryptography' non disponibile"
+        return None, T("libreria 'cryptography' non disponibile")
     if payload is None:
-        return None, "firma detached: documento originale non disponibile"
+        return None, T("firma detached: documento originale non disponibile")
     try:
         algo = signer_info['digest_algorithm']['algorithm'].native
         classe_hash = _HASH_CLASSI.get(algo)
         if classe_hash is None:
-            return None, f"algoritmo di digest '{algo}' non supportato"
+            return None, T("algoritmo di digest '{algo}' non supportato", algo=algo)
         sa = signer_info['signed_attrs']
         if isinstance(sa, Void):
             candidati = [payload]
@@ -955,9 +1269,9 @@ def verifica_integrita(signer_info, cert, payload: Optional[bytes]) -> Tuple[Opt
                     md = a['values'][0].native
                     break
             if md is None:
-                return False, "attributo message-digest mancante"
+                return False, T("attributo message-digest mancante")
             if hashlib.new(algo, payload).digest() != md:
-                return False, "l'impronta del contenuto non corrisponde: documento alterato dopo la firma"
+                return False, T("l'impronta del contenuto non corrisponde: documento alterato dopo la firma")
             # prima la codifica originale (alcuni software non ordinano il SET), poi quella DER canonica
             candidati = [b'\x31' + sa.dump()[1:]]
             canonica = b'\x31' + sa.dump(force=True)[1:]
@@ -968,19 +1282,19 @@ def verifica_integrita(signer_info, cert, payload: Optional[bytes]) -> Tuple[Opt
         for dati in candidati:
             try:
                 _verifica_firma_grezza(chiave, firma, dati, signer_info['signature_algorithm'], classe_hash)
-                return True, "impronta e firma crittografica verificate: documento integro"
+                return True, T("impronta e firma crittografica verificate: documento integro")
             except InvalidSignature:
                 continue
-        return False, "firma crittografica non valida: documento alterato o firma corrotta"
+        return False, T("firma crittografica non valida: documento alterato o firma corrotta")
     except NotImplementedError as e:
-        return None, f"algoritmo di firma '{e}' non supportato"
+        return None, T("algoritmo di firma '{algo}' non supportato", algo=e)
     except Exception as e:
-        return None, f"verifica non eseguibile ({type(e).__name__})"
+        return None, T("verifica non eseguibile ({errore})", errore=type(e).__name__)
 
 
 def verifica_legame_certificato(signer_info, cert) -> Controllo:
     """Attributo ESS signing-certificate: lega la firma proprio a quel certificato."""
-    nome = "Legame firma-certificato"
+    nome = T("Legame firma-certificato")
     try:
         sa = signer_info['signed_attrs']
         if not isinstance(sa, Void):
@@ -990,11 +1304,11 @@ def verifica_legame_certificato(signer_info, cert) -> Controllo:
                     primo = a['values'][0]['certs'][0]
                     algo = 'sha1' if t == 'signing_certificate' else primo['hash_algorithm']['algorithm'].native
                     if hashlib.new(algo, cert.dump()).digest() == primo['cert_hash'].native:
-                        return Controllo(nome, "ok", "l'attributo signing-certificate corrisponde al certificato usato")
-                    return Controllo(nome, "error", "l'attributo signing-certificate indica un certificato diverso da quello usato")
+                        return Controllo(nome, "ok", T("l'attributo signing-certificate corrisponde al certificato usato"))
+                    return Controllo(nome, "error", T("l'attributo signing-certificate indica un certificato diverso da quello usato"))
     except Exception as e:
-        return Controllo(nome, "none", f"attributo non leggibile ({type(e).__name__})")
-    return Controllo(nome, "none", "attributo signing-certificate assente")
+        return Controllo(nome, "none", T("attributo non leggibile ({errore})", errore=type(e).__name__))
+    return Controllo(nome, "none", T("attributo signing-certificate assente"))
 
 
 def token_marca(signer_info):
@@ -1010,7 +1324,7 @@ def token_marca(signer_info):
 
 
 async def verifica_marca(token, dati_marcati: Optional[bytes]) -> Tuple[Optional[bool], Optional[datetime.datetime], str, str]:
-    """Verifica una marca RFC 3161: impronta dei dati marcati, firma del token, certificato TSA.
+    """Verifica una marca RFC 3161: impronta dei dati marcati, firma del token, certificato TSA (e se e' qualificata).
     -> (valida, istante, TSA, spiegazione)"""
     quando, tsa = None, ""
     try:
@@ -1022,25 +1336,27 @@ async def verifica_marca(token, dati_marcati: Optional[bytes]) -> Tuple[Optional
         imprint = info['message_imprint']
         algo = imprint['hash_algorithm']['algorithm'].native
         if dati_marcati is not None and hashlib.new(algo, dati_marcati).digest() != imprint['hashed_message'].native:
-            return False, quando, tsa, "l'impronta della marca non corrisponde alla firma: marca non valida"
+            return False, quando, tsa, T("l'impronta della marca non corrisponde alla firma: marca non valida")
         si = sd['signer_infos'][0]
         certs = certificati_da_sd(sd)
         cert = trova_cert_signer(si, certs)
         if cert is None:
-            return None, quando, tsa, "certificato della TSA non incluso nella marca"
+            return None, quando, tsa, T("certificato della TSA non incluso nella marca")
         tsa = _get(cert.subject, 'common_name') or _get(cert.subject, 'organization_name')
         integra, msg = verifica_integrita(si, cert, contenuto)
         if integra is False:
-            return False, quando, tsa, f"firma della marca non valida ({msg})"
+            return False, quando, tsa, T("firma della marca non valida ({msg})", msg=msg)
         if integra is None:
-            return None, quando, tsa, f"firma della marca non verificabile ({msg})"
+            return None, quando, tsa, T("firma della marca non verificabile ({msg})", msg=msg)
         controlli = await valida_certificato(cert, certs, quando, tsa=True)
         peggiore = next((c for c in controlli if c.stato == "error"), None)
         if peggiore is not None:
-            return False, quando, tsa, f"certificato TSA non attendibile: {peggiore.dettaglio}"
-        return True, quando, tsa, f"marca valida emessa da {tsa or 'TSA'} il {fmt_dt(quando)}"
+            return False, quando, tsa, T("certificato TSA non attendibile: {motivo}", motivo=peggiore.dettaglio)
+        if any(c.codice == "qualificazione" and c.stato == "ok" for c in controlli):
+            return True, quando, tsa, T("marca temporale qualificata eIDAS emessa da {tsa} il {data}", tsa=tsa or "TSA", data=fmt_dt(quando))
+        return True, quando, tsa, T("marca valida emessa da {tsa} il {data}", tsa=tsa or "TSA", data=fmt_dt(quando))
     except Exception as e:
-        return None, quando, tsa, f"marca non verificabile ({type(e).__name__})"
+        return None, quando, tsa, T("marca non verificabile ({errore})", errore=type(e).__name__)
 
 
 def popola_da_cert(fi: FirmaInfo, cert: x509.Certificate):
@@ -1048,7 +1364,7 @@ def popola_da_cert(fi: FirmaInfo, cert: x509.Certificate):
     cn = _get(cert.subject, 'common_name')
     nome = " ".join(x for x in (_get(cert.subject, 'given_name'), _get(cert.subject, 'surname')) if x)
     fi.organizzazione = _get(cert.subject, 'organization_name')
-    fi.firmatario = cn or nome or fi.organizzazione or "Sconosciuto"
+    fi.firmatario = cn or nome or fi.organizzazione or T("Sconosciuto")
     fi.identificativo = _get(cert.subject, 'serial_number')
     fi.emittente = _get(cert.issuer, 'common_name') or _get(cert.issuer, 'organization_name')
     fi.seriale = format(cert.serial_number, 'X')
@@ -1059,38 +1375,225 @@ def popola_da_cert(fi: FirmaInfo, cert: x509.Certificate):
         pass
 
 
-_QC_CONFORME = bytes.fromhex("0606040 08E460101".replace(" ", ""))
-_QC_QSCD = bytes.fromhex("0606040 08E460104".replace(" ", ""))
+# ---- qualificazione eIDAS (ETSI EN 319 412-5 per i QcStatements, ETSI TS 119 612 / 119 615 per la Trusted List)
+OID_QC_STATEMENTS = '1.3.6.1.5.5.7.1.3'
+_QC_COMPLIANCE, _QC_SSCD, _QC_TYPE = '0.4.0.1862.1.1', '0.4.0.1862.1.4', '0.4.0.1862.1.6'
+_QC_TIPI = {'0.4.0.1862.1.6.1': 'esign', '0.4.0.1862.1.6.2': 'eseal', '0.4.0.1862.1.6.3': 'web'}
+# policy dei certificati qualificati: EN 319 411-2 (qcp-n, qcp-l, qcp-n-qscd, qcp-l-qscd, qcp-w) e TS 101 456 (QCP+, QCP)
+_POLICY_QC = {'0.4.0.194112.1.0': ('esign', False), '0.4.0.194112.1.1': ('eseal', False),
+              '0.4.0.194112.1.2': ('esign', True), '0.4.0.194112.1.3': ('eseal', True),
+              '0.4.0.194112.1.4': ('web', False), '0.4.0.1456.1.1': ('', True), '0.4.0.1456.1.2': ('', False)}
+_AMBITO_TIPO = {"ForeSignatures": "esign", "ForeSeals": "eseal", "ForWebSiteAuthentication": "web"}
+_KU_TL = {"digitalSignature": "digital_signature", "nonRepudiation": "non_repudiation", "keyEncipherment": "key_encipherment",
+          "dataEncipherment": "data_encipherment", "keyAgreement": "key_agreement", "keyCertSign": "key_cert_sign",
+          "crlSign": "crl_sign", "encipherOnly": "encipher_only", "decipherOnly": "decipher_only"}
 
 
-def controllo_tipo_certificato(cert) -> Controllo:
-    der = cert.dump()
-    if _QC_CONFORME in der:
-        testo = "certificato qualificato" + (" su dispositivo sicuro (QSCD)" if _QC_QSCD in der else "")
-    else:
-        testo = "certificato non dichiarato come qualificato"
+class _QcStatement(asn1core.Sequence):
+    _fields = [('statement_id', asn1core.ObjectIdentifier), ('statement_info', asn1core.Any, {'optional': True})]
+
+
+class _QcStatements(asn1core.SequenceOf):
+    _child_spec = _QcStatement
+
+
+class _ListaOid(asn1core.SequenceOf):
+    _child_spec = asn1core.ObjectIdentifier
+
+
+def info_qc(cert) -> dict:
+    """Cosa dichiara il certificato: qualificato, su QSCD, per firma/sigillo/web, policy e usi della chiave."""
+    out = {"qc": False, "qscd": False, "tipi": set(), "policy": set(), "ku": set()}
     try:
-        ku = cert.key_usage_value
-        if ku is not None and 'non_repudiation' in ku.native:
-            testo += ", abilitato alla non ripudiabilità"
+        for ext in cert['tbs_certificate']['extensions']:
+            if ext['extn_id'].dotted != OID_QC_STATEMENTS:
+                continue
+            for st in _QcStatements.load(ext['extn_value'].contents):
+                oid = st['statement_id'].dotted
+                if oid == _QC_COMPLIANCE:
+                    out["qc"] = True
+                elif oid == _QC_SSCD:
+                    out["qscd"] = True
+                elif oid == _QC_TYPE and not isinstance(st['statement_info'], Void):
+                    out["tipi"] |= {_QC_TIPI.get(t.dotted, "") for t in _ListaOid.load(st['statement_info'].dump())}
     except Exception:
         pass
-    return Controllo("Tipo di certificato", "none", testo)
+    try:
+        for p in (cert.certificate_policies_value or []):
+            oid = p['policy_identifier'].dotted
+            out["policy"].add(oid)
+            if oid in _POLICY_QC:
+                tipo, qscd = _POLICY_QC[oid]
+                out["qc"] = True
+                out["qscd"] = out["qscd"] or qscd
+                if tipo:
+                    out["tipi"].add(tipo)
+    except Exception:
+        pass
+    try:
+        ku = cert.key_usage_value
+        out["ku"] = set(ku.native) if ku is not None else set()
+    except Exception:
+        pass
+    out["tipi"].discard("")
+    return out
+
+
+def _criteri_soddisfatti(criteri, info: dict) -> bool:
+    """CriteriaList di una QualificationElement (TS 119 612, 5.5.9.2): KeyUsage, PolicySet e liste annidate.
+    Un criterio che non si sa valutare conta come non soddisfatto: meglio non applicare un qualificatore che sbagliarlo."""
+    if criteri is None:
+        return True
+    esiti = []
+    for c in criteri:
+        nome = _tag_locale(c.tag)
+        if nome in ("Description", ""):
+            continue
+        if nome == "KeyUsage":
+            esiti.append(all((_KU_TL.get(b.get("name", ""), "?") in info["ku"]) == (_testo_tl(b).lower() == "true")
+                             for b in c if _tag_locale(b.tag) == "KeyUsageBit"))
+        elif nome == "PolicySet":
+            oid = {_testo_tl(i).replace("urn:oid:", "") for i in c.iter() if _tag_locale(i.tag) == "Identifier"}
+            esiti.append(bool(oid) and oid <= info["policy"])
+        elif nome == "CriteriaList":
+            esiti.append(_criteri_soddisfatti(c, info))
+        else:
+            esiti.append(False)
+    modo = criteri.get("assert", "all")
+    if modo == "atLeastOne":
+        return any(esiti)
+    if modo == "none":
+        return not any(esiti)
+    return all(esiti)
+
+
+def controllo_qualificazione(cert, servizi: List[ServizioTSL], quando, tsa=False) -> Controllo:
+    """Qualificazione eIDAS alla data della firma (o della marca): QES, sigillo qualificato, AdES/QC, non qualificata."""
+    nome, data = T("Qualificazione eIDAS"), fmt_data(quando)
+
+    def esito(stato, testo):
+        return Controllo(nome, stato, testo, "qualificazione")
+
+    def attivi(tipi):
+        return [(s, i) for s in servizi if s.tipo in tipi and (i := s.istanza_a(quando)) is not None and i.stato in _STATI_ATTIVI]
+
+    if tsa:
+        if attivi({"TSA/QTST"}):
+            return esito("ok", T("servizio di marca temporale qualificato (TSA/QTST) attivo al {data}", data=data))
+        return esito("none", T("marca temporale non qualificata secondo la Trusted List"))
+    info = info_qc(cert)
+    if not any(s.tipo == "CA/QC" for s in servizi):
+        if info["qc"]:
+            return esito("warn", T("il certificato si dichiara qualificato, ma il certificatore non è tra i servizi "
+                                   "qualificati della Trusted List"))
+        return esito("none", T("certificato non qualificato: firma elettronica avanzata"))
+    servizio = attivi({"CA/QC"})
+    if not servizio:
+        return esito("warn", T("al {data} il servizio qualificato del certificatore non era attivo: "
+                               "la firma non è qualificata", data=data))
+    _s, ist = servizio[0]
+    qc, qscd, tipi, remota = info["qc"], info["qscd"], set(info["tipi"]), False
+    for qualificatori, criteri in ist.qualificazioni:
+        if not _criteri_soddisfatti(criteri, info):
+            continue
+        if "NotQualified" in qualificatori:
+            qc = False
+        if "QCStatement" in qualificatori:
+            qc = True
+        if qualificatori & {"QCWithSSCD", "QCWithQSCD"}:
+            qscd = True
+        if "QCQSCDManagedOnBehalf" in qualificatori:
+            qscd = remota = True
+        if qualificatori & {"QCNoSSCD", "QCNoQSCD"}:
+            qscd = False
+        for q, t in (("QCForESig", "esign"), ("QCForESeal", "eseal"), ("QCForWSA", "web")):
+            if q in qualificatori:
+                tipi = {t}
+    ambito = {_AMBITO_TIPO[a] for a in ist.ambito if a in _AMBITO_TIPO}
+    if not tipi:                       # tipo non dichiarato: lo dice il campo d'azione del servizio (prima di eIDAS: firma)
+        tipi = ambito if len(ambito) == 1 else ({"esign"} if not ambito else set())
+    elif ambito and not tipi & ambito:
+        qc = False                     # il servizio non e' qualificato per quel tipo di certificato
+    if not qc:
+        if info["qc"]:
+            return esito("warn", T("la Trusted List non conferma la qualificazione dichiarata dal certificato"))
+        return esito("none", T("certificato non qualificato secondo la Trusted List"))
+    dispositivo = T("dispositivo qualificato gestito dal prestatore (firma remota)") if remota else T("dispositivo qualificato (QSCD)")
+    if "esign" in tipi:
+        if qscd:
+            return esito("ok", T("firma elettronica qualificata (QES): certificato qualificato su {dispositivo}", dispositivo=dispositivo))
+        return esito("none", T("firma elettronica avanzata con certificato qualificato (AdES/QC): nessun dispositivo qualificato"))
+    if "eseal" in tipi:
+        if qscd:
+            return esito("ok", T("sigillo elettronico qualificato: certificato qualificato su {dispositivo}", dispositivo=dispositivo))
+        return esito("none", T("sigillo elettronico avanzato con certificato qualificato (AdES/QC): nessun dispositivo qualificato"))
+    if "web" in tipi:
+        return esito("warn", T("certificato qualificato per siti web (QWAC): non è destinato alla firma di documenti"))
+    return esito("none", T("certificato qualificato di tipo non determinabile dalla Trusted List"))
+
+
+def controlli_trusted_list(cert, extra, quando, tsa=False) -> List[Controllo]:
+    """Catena, stato del certificatore nella Trusted List alla data indicata (storico compreso) e qualificazione."""
+    servizi, ancora = ARCHIVIO.trova_servizi(cert, extra, includi_se_stesso=tsa)
+    rilevanti = [s for s in servizi if (s.tipo in _TSL_TIPI_TSA if tsa else s.tipo.startswith("CA/"))] or servizi
+    nome_tl, data = T("Trusted List AgID"), fmt_data(quando)
+    out = []
+    if not rilevanti:
+        out.append(Controllo(T("Catena di fiducia"), "ok", T("verificata sull'archivio di Windows o sulle CA aggiunte")))
+        out.append(Controllo(nome_tl, "none", T("certificatore non presente nella lista"), "tl"))
+    else:
+        nome_ca = ((_get(ancora.subject, 'common_name') or _get(ancora.subject, 'organization_name')) if ancora is not None
+                   else "") or rilevanti[0].nome_breve
+        out.append(Controllo(T("Catena di fiducia"), "ok", T("verificata fino a «{nome}»", nome=nome_ca)))
+        attivi = [(s, i) for s in rilevanti if (i := s.istanza_a(quando)) is not None and i.stato in _STATI_ATTIVI]
+        if attivi:
+            s, i = attivi[0]
+            tl = Controllo(nome_tl, "ok", T("«{tsp}»: servizio {tipo} {stato} al {data}", tsp=s.tsp or s.nome_breve,
+                                            tipo=s.tipo, stato=STATI_TL.get(i.stato, i.stato), data=data), "tl")
+        else:
+            s = rilevanti[0]
+            i = s.istanza_a(quando)
+            if i is None:
+                tl = Controllo(nome_tl, "warn", T("al {data} il servizio «{nome}» non era ancora nella lista",
+                                                  data=data, nome=s.nome_breve), "tl")
+            else:
+                tl = Controllo(nome_tl, "warn", T("«{tsp}»: al {data} il servizio {tipo} risultava {stato} (dal {dal})",
+                                                  tsp=s.tsp or s.nome_breve, data=data, tipo=s.tipo,
+                                                  stato=STATI_TL.get(i.stato, i.stato), dal=fmt_data(i.inizio)), "tl")
+        prossima = ARCHIVIO.tsl_meta.get("prossima")
+        if prossima and prossima < datetime.datetime.now(datetime.timezone.utc):
+            tl.stato = "warn" if tl.stato == "ok" else tl.stato
+            tl.dettaglio += " — " + T("lista scaduta il {data}: aggiornala dalle Impostazioni", data=fmt_data(prossima))
+        out.append(tl)
+    out.append(controllo_qualificazione(cert, rilevanti, quando, tsa))
+    return out
+
+
+def controllo_uso_chiave(cert) -> Controllo:
+    nome = T("Uso della chiave")
+    ku = info_qc(cert)["ku"]
+    if not ku:
+        return Controllo(nome, "none", T("estensione keyUsage assente"))
+    if "non_repudiation" in ku:
+        return Controllo(nome, "ok", T("chiave abilitata alla firma con non ripudio"))
+    if "digital_signature" in ku:
+        return Controllo(nome, "ok", T("chiave abilitata alla firma digitale (senza non ripudio)"))
+    return Controllo(nome, "error", T("il certificato non è abilitato alla firma (usi: {usi})", usi=", ".join(sorted(ku))))
 
 
 def controllo_algoritmi(fi: FirmaInfo, cert) -> Controllo:
     deboli = []
     if fi.algo_hash.lower() in ('md5', 'md2', 'sha1'):
-        deboli.append(f"impronta {fi.algo_hash.upper()}")
+        deboli.append(T("impronta {algo}", algo=fi.algo_hash.upper()))
     try:
         if cert.public_key.algorithm == 'rsa' and cert.public_key.bit_size < 2048:
-            deboli.append(f"chiave RSA a {cert.public_key.bit_size} bit")
+            deboli.append(T("chiave RSA a {bit} bit", bit=cert.public_key.bit_size))
     except Exception:
         pass
     testo = " / ".join(x for x in (fi.algo_hash, fi.algo_firma) if x)
     if deboli:
-        return Controllo("Algoritmi", "warn", "algoritmi oggi considerati deboli: " + ", ".join(deboli))
-    return Controllo("Algoritmi", "ok", testo or "non indicati")
+        return Controllo(T("Algoritmi"), "warn", T("algoritmi oggi considerati deboli: {elenco}", elenco=", ".join(deboli)))
+    return Controllo(T("Algoritmi"), "ok", testo or T("non indicati"))
 
 
 def controllo_tempi(fi: FirmaInfo) -> Optional[Controllo]:
@@ -1099,16 +1602,18 @@ def controllo_tempi(fi: FirmaInfo) -> Optional[Controllo]:
         return None
     if d.tzinfo is None:
         d = d.replace(tzinfo=datetime.timezone.utc)
+    nome = T("Data di firma")
     if d > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
-        return Controllo("Data di firma", "warn", f"la data dichiarata ({fmt_dt(d)}) è nel futuro")
+        return Controllo(nome, "warn", T("la data dichiarata ({data}) è nel futuro", data=fmt_dt(d)))
     if fi.valido_dal and d < fi.valido_dal:
-        return Controllo("Data di firma", "warn", f"la data dichiarata ({fmt_dt(d)}) precede l'inizio di validità del certificato")
+        return Controllo(nome, "warn", T("la data dichiarata ({data}) precede l'inizio di validità del certificato", data=fmt_dt(d)))
     if fi.valido_al and d > fi.valido_al:
-        return Controllo("Data di firma", "warn", f"la data dichiarata ({fmt_dt(d)}) è successiva alla scadenza del certificato")
+        return Controllo(nome, "warn", T("la data dichiarata ({data}) è successiva alla scadenza del certificato", data=fmt_dt(d)))
     return None
 
 
-async def _valida_cert_reale(cert, certs_busta, momento_firma, moment, marca, tsa) -> List[Controllo]:
+async def _valida_cert_reale(cert, certs_busta, momento_firma, moment, marca, tsa):
+    """Validazione del percorso (costosa, con rete): -> (controlli prima, controlli dopo, catena estesa, percorso valido)"""
     c: List[Controllo] = []
     ora = datetime.datetime.now(datetime.timezone.utc)
     try:
@@ -1124,6 +1629,7 @@ async def _valida_cert_reale(cert, certs_busta, momento_firma, moment, marca, ts
                             allow_fetching=revoca_attiva, revocation_mode="soft-fail", moment=moment,
                             # a una data passata OCSP/CRL sono per forza successive: vanno accettate lo stesso
                             retroactive_revinfo=bool(moment))
+    n_validita, n_catena, n_revoca = T("Validità del certificato"), T("Catena di fiducia"), T("Revoca")
     try:
         validatore = CertificateValidator(cert, validation_context=ctx)
         if tsa:
@@ -1136,71 +1642,61 @@ async def _valida_cert_reale(cert, certs_busta, momento_firma, moment, marca, ts
         if 'Revoked' in nome_err:
             quando = getattr(e, 'revocation_dt', None)
             motivo = getattr(getattr(e, 'reason', None), 'human_friendly', '')
-            c.append(Controllo("Revoca", "error", "certificato REVOCATO" + (f" il {fmt_dt(quando)}" if quando else "")
+            c.append(Controllo(n_revoca, "error", T("certificato REVOCATO") + (" " + T("il {data}", data=fmt_dt(quando)) if quando else "")
                                + (f" ({motivo})" if motivo else "")))
         elif futuro:
-            c.append(Controllo("Validità del certificato", "error", f"non ancora valido (dal {fmt_data(nb)})"))
+            c.append(Controllo(n_validita, "error", T("non ancora valido (dal {data})", data=fmt_data(nb))))
         elif 'Expired' in nome_err or (scaduto and not moment):
-            c.append(Controllo("Validità del certificato", "error", f"scaduto il {fmt_data(na)}, nessuna data utile per valutarlo"))
+            c.append(Controllo(n_validita, "error", T("scaduto il {data}, nessuna data utile per valutarlo", data=fmt_data(na))))
+        elif 'self-signed' in msg.lower() or 'self signed' in msg.lower():
+            c.append(Controllo(n_catena, "error", T("certificato autofirmato: nessuna autorità di certificazione attendibile "
+                                                    "ne garantisce l'identità")))
         elif isinstance(e, PathValidationError) or 'PathBuilding' in nome_err or 'Validation' in nome_err:
             radice = ARCHIVIO.radice_catena(cert, extra)
             if radice is not None and hashlib.sha256(radice.dump()).hexdigest() not in ARCHIVIO.hash_radici:
                 nome_radice = _get(radice.subject, 'common_name') or _get(radice.subject, 'organization_name')
-                c.append(Controllo("Catena di fiducia", "warn", f"catena completa fino a «{nome_radice}», radice non presente "
-                                   "tra quelle attendibili (si può aggiungere in Impostazioni)"))
+                c.append(Controllo(n_catena, "warn", T("catena completa fino a «{nome}», radice non presente tra quelle "
+                                                       "attendibili (si può aggiungere in Impostazioni)", nome=nome_radice)))
             else:
-                emittente = _get(cert.issuer, 'common_name') or _get(cert.issuer, 'organization_name') or "sconosciuto"
+                emittente = _get(cert.issuer, 'common_name') or _get(cert.issuer, 'organization_name') or T("sconosciuto")
                 if 'PathBuilding' in nome_err:
-                    c.append(Controllo("Catena di fiducia", "error", f"l'emittente «{emittente}» non è tra le autorità attendibili "
-                                       "(Trusted List AgID, archivio di Windows, CA aggiunte)"))
+                    c.append(Controllo(n_catena, "error", T("l'emittente «{nome}» non è tra le autorità attendibili "
+                                                            "(Trusted List AgID, archivio di Windows, CA aggiunte)", nome=emittente)))
                 else:
-                    c.append(Controllo("Catena di fiducia", "error", f"non verificata: {msg}"))
+                    c.append(Controllo(n_catena, "error", T("non verificata: {msg}", msg=msg)))
         else:
-            c.append(Controllo("Validazione del certificato", "warn", f"verifica parziale: {msg}"))
-        return c
+            c.append(Controllo(T("Validazione del certificato"), "warn", T("verifica parziale: {msg}", msg=msg)))
+        return c, [], extra, False
     finally:
         try:
             await ctx.aclose()
         except Exception:
             pass
 
-    periodo = f"dal {fmt_data(nb)} al {fmt_data(na)}"
+    periodo = T("dal {inizio} al {fine}", inizio=fmt_data(nb), fine=fmt_data(na))
     if tsa:
-        c.append(Controllo("Validità del certificato", "ok", f"valido al momento della marca ({periodo})"))
+        c.append(Controllo(n_validita, "ok", T("valido al momento della marca ({periodo})", periodo=periodo)))
     elif moment and marca:
-        c.append(Controllo("Validità del certificato", "ok", f"valido alla data della marca temporale, {fmt_dt(moment)} ({periodo})"))
+        c.append(Controllo(n_validita, "ok", T("valido alla data della marca temporale, {data} ({periodo})",
+                                               data=fmt_dt(moment), periodo=periodo)))
     elif moment:
-        c.append(Controllo("Validità del certificato", "warn", f"scaduto il {fmt_data(na)}: valido solo alla data di firma "
-                           "dichiarata dal firmatario, senza marca temporale opponibile"))
+        c.append(Controllo(n_validita, "warn", T("scaduto il {data}: valido solo alla data di firma dichiarata dal firmatario, "
+                                                 "senza marca temporale opponibile", data=fmt_data(na))))
     else:
-        c.append(Controllo("Validità del certificato", "ok", f"in corso di validità ({periodo})"))
-    ancora = ARCHIVIO.ancora_tsl(cert, extra)
-    if ancora is not None:
-        tipo, ritiro = ARCHIVIO.tsl[hashlib.sha256(ancora.dump()).hexdigest()]
-        nome_ca = _get(ancora.subject, 'common_name') or _get(ancora.subject, 'organization_name')
-        quando = moment or momento_firma or ora
-        if quando.tzinfo is None:
-            quando = quando.replace(tzinfo=datetime.timezone.utc)
-        c.append(Controllo("Catena di fiducia", "ok", f"verificata fino a «{nome_ca}»"))
-        if ritiro and quando >= ritiro:
-            c.append(Controllo("Trusted List AgID", "warn", f"certificatore «{nome_ca}» ritirato dalla lista il {fmt_data(ritiro)}, prima della firma"))
-        else:
-            c.append(Controllo("Trusted List AgID", "ok", f"certificatore qualificato eIDAS ({tipo})"))
-    else:
-        c.append(Controllo("Catena di fiducia", "ok", "verificata sull'archivio di Windows o sulle CA aggiunte"))
-        c.append(Controllo("Trusted List AgID", "none", "certificatore non presente nella lista"))
+        c.append(Controllo(n_validita, "ok", T("in corso di validità ({periodo})", periodo=periodo)))
+    dopo: List[Controllo] = []
     if not revoca_attiva:
-        c.append(Controllo("Revoca", "none", "controllo OCSP/CRL disattivato nelle impostazioni"))
+        dopo.append(Controllo(n_revoca, "none", T("controllo OCSP/CRL disattivato nelle impostazioni")))
     else:
         try:
             mancate = list(ctx.soft_fail_exceptions)
         except Exception:
             mancate = []
         if mancate:
-            c.append(Controllo("Revoca", "warn", "stato non determinabile: server OCSP/CRL non raggiungibili o senza risposta utile"))
+            dopo.append(Controllo(n_revoca, "warn", T("stato non determinabile: server OCSP/CRL non raggiungibili o senza risposta utile")))
         else:
-            c.append(Controllo("Revoca", "ok", "nessuna revoca risultante da OCSP/CRL"))
-    return c
+            dopo.append(Controllo(n_revoca, "ok", T("nessuna revoca risultante da OCSP/CRL")))
+    return c, dopo, extra, True
 
 
 async def valida_certificato(cert, certs_busta, momento_firma, marca=None, tsa=False) -> List[Controllo]:
@@ -1221,23 +1717,31 @@ async def valida_certificato(cert, certs_busta, momento_firma, marca=None, tsa=F
     chiave = (hashlib.sha256(cert.dump()).hexdigest(), moment.isoformat() if moment else "", bool(IMP["revoca"]), bool(marca), tsa)
     async with ARCHIVIO.lock_chiave(chiave):
         if chiave in ARCHIVIO.cache_validazione:
-            return list(ARCHIVIO.cache_validazione[chiave])
-        controlli = await _valida_cert_reale(cert, certs_busta, momento_firma, moment, marca, tsa)
-        if len(ARCHIVIO.cache_validazione) > 3000:
-            ARCHIVIO.cache_validazione.clear()
-        ARCHIVIO.cache_validazione[chiave] = list(controlli)
-    return controlli
+            prima, dopo, extra, valido = ARCHIVIO.cache_validazione[chiave]
+        else:
+            prima, dopo, extra, valido = await _valida_cert_reale(cert, certs_busta, momento_firma, moment, marca, tsa)
+            if len(ARCHIVIO.cache_validazione) > 3000:
+                ARCHIVIO.cache_validazione.clear()
+            ARCHIVIO.cache_validazione[chiave] = (prima, dopo, extra, valido)
+    if not valido:
+        return [Controllo(x.nome, x.stato, x.dettaglio, x.codice) for x in prima]
+    # la Trusted List si valuta alla data piu' affidabile: marca verificata, poi data dichiarata, poi oggi
+    quando = moment or momento_firma or ora
+    if quando.tzinfo is None:
+        quando = quando.replace(tzinfo=datetime.timezone.utc)
+    return ([Controllo(x.nome, x.stato, x.dettaglio, x.codice) for x in prima] + controlli_trusted_list(cert, extra, quando, tsa)
+            + [Controllo(x.nome, x.stato, x.dettaglio, x.codice) for x in dopo])
 
 
 def controllo_integrita(fi: FirmaInfo) -> Controllo:
-    return Controllo("Integrità del documento", {True: "ok", False: "error", None: "warn"}[fi.integrita],
-                     fi.integrita_msg or "non verificata")
+    return Controllo(T("Integrità del documento"), {True: "ok", False: "error", None: "warn"}[fi.integrita],
+                     fi.integrita_msg or T("non verificata"))
 
 
 def controllo_marca(fi: FirmaInfo, msg: str) -> Controllo:
     if fi.marca_temporale is None and not msg:
-        return Controllo("Marca temporale", "none", "assente: la data di firma è solo dichiarata")
-    return Controllo("Marca temporale", {True: "ok", False: "warn", None: "warn"}[fi.marca_valida], msg)
+        return Controllo(T("Marca temporale"), "none", T("assente: la data di firma è solo dichiarata"))
+    return Controllo(T("Marca temporale"), {True: "ok", False: "warn", None: "warn"}[fi.marca_valida], msg)
 
 
 def combina_esito(fi: FirmaInfo):
@@ -1248,7 +1752,9 @@ def combina_esito(fi: FirmaInfo):
             fi.stato, fi.esito = s, f"{c.nome}: {c.dettaglio}"
             return
     fi.stato = "ok"
-    fi.esito = "Firma valida: integrità, certificato e catena di fiducia verificati"
+    qualificata = any(c.codice == "qualificazione" and c.stato == "ok" for c in fi.controlli)
+    fi.esito = (T("Firma valida e qualificata eIDAS: integrità, certificato, catena e qualificazione verificati") if qualificata
+                else T("Firma valida: integrità, certificato e catena di fiducia verificati"))
 
 
 # ============================================================ MOTORE: CAdES
@@ -1257,18 +1763,18 @@ async def _analizza_signer(si, certs, payload, livello, tipo="Firma", formato="C
     fi.algo_hash, fi.algo_firma = algoritmi(si)
     st, marca = estrai_tempi(si)
     if st:
-        fi.data_firma, fi.fonte_data = st, "Attributo signing-time della firma"
+        fi.data_firma, fi.fonte_data = st, T("Attributo signing-time della firma")
     fi.marca_temporale = marca
     if marca and not fi.data_firma:
-        fi.data_firma, fi.fonte_data = marca, "Marca temporale (RFC 3161)"
+        fi.data_firma, fi.fonte_data = marca, T("Marca temporale (RFC 3161)")
     cert = trova_cert_signer(si, certs)
     if cert is None:
-        fi.stato, fi.esito = "error", "Certificato del firmatario non presente nella busta"
-        fi.controlli.append(Controllo("Certificato", "error", "non presente nella busta"))
+        fi.stato, fi.esito = "error", T("Certificato del firmatario non presente nella busta")
+        fi.controlli.append(Controllo(T("Certificato"), "error", T("non presente nella busta")))
         return fi
     popola_da_cert(fi, cert)
     if not valida:
-        fi.esito = "Verifica non eseguita (solo estrazione)"
+        fi.esito = T("Verifica non eseguita (solo estrazione)")
         return fi
     fi.integrita, fi.integrita_msg = verifica_integrita(si, cert, payload)
     fi.controlli.append(controllo_integrita(fi))
@@ -1281,7 +1787,7 @@ async def _analizza_signer(si, certs, payload, livello, tipo="Firma", formato="C
     fi.controlli.append(controllo_marca(fi, msg_marca))
     fi.controlli += await valida_certificato(cert, certs, fi.data_firma, fi.marca_temporale if fi.marca_valida else None)
     fi.controlli.append(controllo_algoritmi(fi, cert))
-    fi.controlli.append(controllo_tipo_certificato(cert))
+    fi.controlli.append(controllo_uso_chiave(cert))
     t = controllo_tempi(fi)
     if t is not None:
         fi.controlli.append(t)
@@ -1324,10 +1830,10 @@ async def analizza_p7m(ris: RisultatoDoc, valida: bool = True):
         try:
             info = carica_cms(contenuto, consenti_b64=(contenuto.lstrip()[:1] == b'M'))
         except Exception:
-            ris.errore = "Decodifica fallita: il file non è una busta CMS/PKCS#7 valida"
+            ris.errore = T("Decodifica fallita: il file non è una busta CMS/PKCS#7 valida")
             return
         if info['content_type'].native != 'signed_data':
-            ris.errore = "Busta corrotta: tipo CMS diverso da SignedData"
+            ris.errore = T("Busta corrotta: tipo CMS diverso da SignedData")
             return
         sd = info['content']
         payload = sd['encap_content_info']['content']
@@ -1338,9 +1844,9 @@ async def analizza_p7m(ris: RisultatoDoc, valida: bool = True):
             if originale:
                 with open(originale, 'rb') as f:
                     payload_bytes = f.read()
-                ris.note.append(f"Firma detached verificata sul file accanto: {os.path.basename(originale)}")
+                ris.note.append(T("Firma detached verificata sul file accanto: {nome}", nome=os.path.basename(originale)))
             else:
-                ris.note.append("Firma detached: il documento firmato non è incluso e non è stato trovato accanto")
+                ris.note.append(T("Firma detached: il documento firmato non è incluso e non è stato trovato accanto"))
         ris.firme.extend(await analizza_signed_data(sd, payload_bytes, livello, valida))
         if not detached and payload_bytes and livello < MAX_ANNIDAMENTO and IMP["estrai_annidati"] and e_busta_cms(payload_bytes):
             contenuto = payload_bytes
@@ -1363,13 +1869,13 @@ def leggi_contenuto_p7m(path: str) -> bytes:
     while True:
         info = carica_cms(dati, dati.lstrip()[:1] == b'M')
         if info['content_type'].native != 'signed_data':
-            raise ValueError("busta non valida")
+            raise ValueError(T("busta non valida"))
         payload = info['content']['encap_content_info']['content']
         if isinstance(payload, Void):
-            raise ValueError("contenuto assente (firma detached)")
+            raise ValueError(T("contenuto assente (firma detached)"))
         dati = byte_ottetti(payload)
         if not dati:
-            raise ValueError("contenuto vuoto")
+            raise ValueError(T("contenuto vuoto"))
         if IMP["estrai_annidati"] and livello < MAX_ANNIDAMENTO and e_busta_cms(dati):
             livello += 1
             continue
@@ -1419,20 +1925,20 @@ def descrivi_modifiche(status) -> Tuple[str, str]:
     dr = getattr(status, 'diff_result', None)
     cov = getattr(getattr(status, 'coverage', None), 'name', None)
     if dr is not None and type(dr).__name__ == 'SuspiciousModification':
-        return "error", "Il documento risulta MODIFICATO dopo la firma"
+        return "error", T("Il documento risulta MODIFICATO dopo la firma")
     lvl = getattr(getattr(status, 'modification_level', None), 'name', None)
     if cov == 'ENTIRE_FILE':
-        return "ok", "La firma copre l'intero file: documento non modificato dopo la firma"
+        return "ok", T("La firma copre l'intero file: documento non modificato dopo la firma")
     if cov == 'ENTIRE_REVISION':
         if lvl in (None, 'NONE'):
-            return "ok", "Documento non modificato dopo la firma"
+            return "ok", T("Documento non modificato dopo la firma")
         if lvl in ('LTA_UPDATES', 'FORM_FILLING', 'ANNOTATIONS'):
-            etichette = {'LTA_UPDATES': "aggiornamenti di validazione a lungo termine",
-                         'FORM_FILLING': "compilazione di moduli", 'ANNOTATIONS': "annotazioni"}
-            return "warn", f"Dopo la firma sono state aggiunte modifiche consentite ({etichette[lvl]})"
-        return "error", "Il documento risulta MODIFICATO dopo la firma"
+            etichette = {'LTA_UPDATES': T("aggiornamenti di validazione a lungo termine"),
+                         'FORM_FILLING': T("compilazione di moduli"), 'ANNOTATIONS': T("annotazioni")}
+            return "warn", T("Dopo la firma sono state aggiunte modifiche consentite ({tipo})", tipo=etichette[lvl])
+        return "error", T("Il documento risulta MODIFICATO dopo la firma")
     if cov:
-        return "warn", f"La firma non copre l'intero file (copertura: {cov.lower().replace('_', ' ')})"
+        return "warn", T("La firma non copre l'intero file (copertura: {copertura})", copertura=cov.lower().replace('_', ' '))
     return "", ""
 
 
@@ -1458,20 +1964,20 @@ async def _firma_pdf(sig, valida=True) -> FirmaInfo:
     m = parse_pdf_date(_pdf_val(obj, '/M'))
     fi.data_pdf_m, fi.marca_temporale = m, marca
     if is_ts and marca:
-        fi.data_firma, fi.fonte_data = marca, "Marca temporale (RFC 3161)"
+        fi.data_firma, fi.fonte_data = marca, T("Marca temporale (RFC 3161)")
     elif attr:
-        fi.data_firma, fi.fonte_data = attr, "Attributo signing-time della firma"
+        fi.data_firma, fi.fonte_data = attr, T("Attributo signing-time della firma")
     elif m:
-        fi.data_firma, fi.fonte_data = m, "Data /M del dizionario di firma PDF"
+        fi.data_firma, fi.fonte_data = m, T("Data /M del dizionario di firma PDF")
     elif marca:
-        fi.data_firma, fi.fonte_data = marca, "Marca temporale (RFC 3161)"
+        fi.data_firma, fi.fonte_data = marca, T("Marca temporale (RFC 3161)")
     if attr and m and abs((attr - m).total_seconds()) > 300:
-        fi.note.append("La data /M del PDF differisce dall'attributo signing-time di oltre 5 minuti")
+        fi.note.append(T("La data /M del PDF differisce dall'attributo signing-time di oltre 5 minuti"))
     cert = trova_cert_signer(si, certs)
     if cert is not None:
         popola_da_cert(fi, cert)
     if not valida:
-        fi.esito = "Verifica non eseguita (solo estrazione)"
+        fi.esito = T("Verifica non eseguita (solo estrazione)")
         return fi
 
     # integrita' (digest + firma + analisi modifiche) tramite pyHanko; la fiducia si valuta a parte
@@ -1487,25 +1993,25 @@ async def _firma_pdf(sig, valida=True) -> FirmaInfo:
             status = None
         if status is not None:
             fi.integrita = bool(status.intact and status.valid)
-            fi.integrita_msg = ("impronta e firma crittografica verificate" if fi.integrita
-                                else "impronta o firma crittografica non valide: documento alterato o firma corrotta")
+            fi.integrita_msg = (T("impronta e firma crittografica verificate") if fi.integrita
+                                else T("impronta o firma crittografica non valide: documento alterato o firma corrotta"))
             fi.mod_livello, fi.modifiche = descrivi_modifiche(status)
         else:
-            fi.integrita_msg = "motore di verifica PDF non disponibile"
+            fi.integrita_msg = T("motore di verifica PDF non disponibile")
     except Exception as e:
-        fi.integrita, fi.integrita_msg = None, f"verifica non eseguibile ({type(e).__name__})"
+        fi.integrita, fi.integrita_msg = None, T("verifica non eseguibile ({errore})", errore=type(e).__name__)
     fi.controlli.append(controllo_integrita(fi))
-    if fi.modifiche:
-        fi.controlli.append(Controllo("Modifiche dopo la firma", fi.mod_livello or "none", fi.modifiche))
+    if fi.modifiche and fi.integrita is not False:        # se l'impronta non torna, l'analisi delle revisioni non conta
+        fi.controlli.append(Controllo(T("Modifiche dopo la firma"), fi.mod_livello or "none", fi.modifiche))
 
     if cert is None:
-        fi.controlli.append(Controllo("Certificato", "error", "non presente nella firma"))
+        fi.controlli.append(Controllo(T("Certificato"), "error", T("non presente nella firma")))
         combina_esito(fi)
         return fi
     msg_marca = ""
     if is_ts:
         fi.marca_valida = fi.integrita
-        msg_marca = f"marca del documento: {fi.integrita_msg}"
+        msg_marca = T("marca del documento: {esito}", esito=fi.integrita_msg)
     else:
         fi.controlli.append(verifica_legame_certificato(si, cert))
         token = token_marca(si)
@@ -1519,7 +2025,7 @@ async def _firma_pdf(sig, valida=True) -> FirmaInfo:
         fi.controlli += await valida_certificato(cert, certs, fi.data_firma, fi.marca_temporale if fi.marca_valida else None)
     fi.controlli.append(controllo_algoritmi(fi, cert))
     if not is_ts:
-        fi.controlli.append(controllo_tipo_certificato(cert))
+        fi.controlli.append(controllo_uso_chiave(cert))
         t = controllo_tempi(fi)
         if t is not None:
             fi.controlli.append(t)
@@ -1547,14 +2053,14 @@ async def analizza_pdf(ris: RisultatoDoc, valida: bool = True):
         try:
             sigs = _apri_pdf(f)
         except Exception as e:
-            ris.errore = f"PDF non leggibile o protetto da password ({type(e).__name__})"
+            ris.errore = T("PDF non leggibile o protetto da password ({errore})", errore=type(e).__name__)
             return
         for sig in sigs:
             try:
                 ris.firme.append(await _firma_pdf(sig, valida))
             except Exception as e:
                 ris.firme.append(FirmaInfo(formato="PAdES", stato="error",
-                                           esito=f"Errore di lettura della firma ({type(e).__name__}: {e})"))
+                                           esito=T("Errore di lettura della firma ({errore})", errore=f"{type(e).__name__}: {e}")))
 
 
 # ============================================================ MOTORE: XAdES + FatturaPA
@@ -1595,19 +2101,19 @@ def riepilogo_fattura(dati: bytes) -> Optional[dict]:
         return a
 
     out = {
-        "Cedente / prestatore": anagrafica('CedentePrestatore'),
-        "P.IVA cedente": _percorso(h, 'CedentePrestatore', 'DatiAnagrafici', 'IdFiscaleIVA', 'IdCodice'),
-        "Cessionario / committente": anagrafica('CessionarioCommittente'),
-        "P.IVA cessionario": _percorso(h, 'CessionarioCommittente', 'DatiAnagrafici', 'IdFiscaleIVA', 'IdCodice'),
-        "Progressivo invio": _percorso(h, 'DatiTrasmissione', 'ProgressivoInvio'),
-        "Codice destinatario": _percorso(h, 'DatiTrasmissione', 'CodiceDestinatario'),
+        T("Cedente / prestatore"): anagrafica('CedentePrestatore'),
+        T("P.IVA cedente"): _percorso(h, 'CedentePrestatore', 'DatiAnagrafici', 'IdFiscaleIVA', 'IdCodice'),
+        T("Cessionario / committente"): anagrafica('CessionarioCommittente'),
+        T("P.IVA cessionario"): _percorso(h, 'CessionarioCommittente', 'DatiAnagrafici', 'IdFiscaleIVA', 'IdCodice'),
+        T("Progressivo invio"): _percorso(h, 'DatiTrasmissione', 'ProgressivoInvio'),
+        T("Codice destinatario"): _percorso(h, 'DatiTrasmissione', 'CodiceDestinatario'),
     }
     if b is not None:
         out.update({
-            "Tipo documento": _percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'TipoDocumento'),
-            "Numero": _percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'Numero'),
-            "Data": _percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'Data'),
-            "Importo totale": (_percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'ImportoTotaleDocumento') + " " +
+            T("Tipo documento"): _percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'TipoDocumento'),
+            T("Numero"): _percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'Numero'),
+            T("Data"): _percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'Data'),
+            T("Importo totale"): (_percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'ImportoTotaleDocumento') + " " +
                                _percorso(b, 'DatiGenerali', 'DatiGeneraliDocumento', 'Divisa')).strip(),
         })
     return {k: v for k, v in out.items() if v}
@@ -1664,16 +2170,16 @@ def _verifica_riferimento(rif, sig_indice: int, dati: bytes) -> Tuple[Optional[b
     firma = list(radice.iter())[sig_indice]
     uri = rif.get("URI")
     if uri is None or (uri and not uri.startswith("#")):
-        return None, f"riferimento esterno non verificabile ({uri})", False
+        return None, T("riferimento esterno non verificabile ({uri})", uri=uri), False
     if uri in ("", "#xpointer(/)"):
         nodo, copre = albero, True
     else:
         ident = re.sub(r"^#xpointer\(id\('(.*)'\)\)$", r"\1", uri).lstrip("#")
         ids, doppi = _mappa_id(radice)
         if ident in doppi:
-            return False, f"Id «{ident}» duplicato nel documento: possibile manomissione", False
+            return False, T("Id «{id}» duplicato nel documento: possibile manomissione", id=ident), False
         if ident not in ids:
-            return False, f"elemento «{ident}» firmato non trovato", False
+            return False, T("elemento «{id}» firmato non trovato", id=ident), False
         nodo, copre = ids[ident], ids[ident] is radice
     c14n_alg = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
     trasf = rif.find(_DS + "Transforms")
@@ -1688,34 +2194,34 @@ def _verifica_riferimento(rif, sig_indice: int, dati: bytes) -> Tuple[Optional[b
         elif alg.endswith("REC-xpath-19991116") or alg.endswith("xmldsig-filter2"):
             testo = " ".join((x.text or "") for x in t if isinstance(x.tag, str))
             if "Signature" not in testo or not ("not(" in testo or any(x.get("Filter") == "subtract" for x in t if isinstance(x.tag, str))):
-                return None, f"trasformazione XPath non supportata ({testo.strip()[:60]})", False
+                return None, T("trasformazione XPath non supportata ({testo})", testo=testo.strip()[:60]), False
             for s in list(radice.iter(_DS + "Signature")):
                 _togli_nodo(s)
         else:
-            return None, f"trasformazione non supportata ({alg})", False
+            return None, T("trasformazione non supportata ({alg})", alg=alg), False
     dm, dv = rif.find(_DS + "DigestMethod"), rif.find(_DS + "DigestValue")
     algo = _alg_hash_xml(dm.get("Algorithm", "")) if dm is not None else None
     if algo is None or dv is None:
-        return None, "algoritmo di impronta non supportato", False
+        return None, T("algoritmo di impronta non supportato"), False
     calcolata = hashlib.new(algo, _c14n(nodo, c14n_alg)).digest()
     if calcolata != base64.b64decode("".join((dv.text or "").split())):
-        return False, f"l'impronta del riferimento «{uri or 'documento'}» non corrisponde: documento alterato", copre
+        return False, T("l'impronta del riferimento «{uri}» non corrisponde: documento alterato", uri=uri or T("documento")), copre
     return True, "", copre
 
 
 def verifica_xmldsig(firma, radice, dati: bytes, cert) -> Tuple[Optional[bool], str, Optional[bool]]:
     """Verifica un ds:Signature: riferimenti + SignedInfo. -> (esito, messaggio, firma copre l'intero documento)"""
     if etree is None or not HAS_CRYPTO:
-        return None, "librerie lxml/cryptography non disponibili", None
+        return None, T("librerie lxml/cryptography non disponibili"), None
     try:
         si = firma.find(_DS + "SignedInfo")
         sv = firma.find(_DS + "SignatureValue")
         if si is None or sv is None:
-            return False, "struttura ds:Signature incompleta", None
+            return False, T("struttura ds:Signature incompleta"), None
         indice = list(radice.iter()).index(firma)
         rifs = si.findall(_DS + "Reference")
         if not rifs:
-            return False, "nessun riferimento firmato", None
+            return False, T("nessun riferimento firmato"), None
         copre = False
         for r in rifs:
             esito, msg, c = _verifica_riferimento(r, indice, dati)
@@ -1729,7 +2235,7 @@ def verifica_xmldsig(firma, radice, dati: bytes, cert) -> Tuple[Optional[bool], 
         chiave = serialization.load_der_public_key(cert['tbs_certificate']['subject_public_key_info'].dump())
         nome_h = next((n for n in ("sha3-256", "sha3-384", "sha3-512", "sha224", "sha256", "sha384", "sha512", "sha1") if n in alg_uri.lower()), None)
         if nome_h is None:
-            return None, f"algoritmo di firma non supportato ({alg_uri})", copre
+            return None, T("algoritmo di firma non supportato ({alg})", alg=alg_uri), copre
         h = _HASH_CLASSI[nome_h.replace("-", "_")]()
         if "MGF1" in alg_uri or "rsa-pss" in alg_uri.lower():
             chiave.verify(valore, canonico, padding.PSS(mgf=padding.MGF1(h), salt_length=h.digest_size), h)
@@ -1740,17 +2246,17 @@ def verifica_xmldsig(firma, radice, dati: bytes, cert) -> Tuple[Optional[bool], 
         elif "rsa" in alg_uri.lower():
             chiave.verify(valore, canonico, padding.PKCS1v15(), h)
         else:
-            return None, f"algoritmo di firma non supportato ({alg_uri})", copre
-        return True, "riferimenti e firma crittografica verificati: documento integro", copre
+            return None, T("algoritmo di firma non supportato ({alg})", alg=alg_uri), copre
+        return True, T("riferimenti e firma crittografica verificati: documento integro"), copre
     except InvalidSignature:
-        return False, "firma crittografica non valida: documento alterato o firma corrotta", None
+        return False, T("firma crittografica non valida: documento alterato o firma corrotta"), None
     except Exception as e:
-        return None, f"verifica non eseguibile ({type(e).__name__}: {e})", None
+        return None, T("verifica non eseguibile ({errore})", errore=f"{type(e).__name__}: {e}"), None
 
 
 def _certificato_xades(firma, certs) -> Tuple[Optional[x509.Certificate], Optional[Controllo]]:
     """Sceglie il certificato del firmatario: quello indicato da xades:SigningCertificate, se presente."""
-    nome = "Legame firma-certificato"
+    nome = T("Legame firma-certificato")
     non_ca = [c for c in certs if not getattr(c, 'ca', False)]
     scelto = non_ca[0] if non_ca else (certs[0] if certs else None)
     digest_attesi = []
@@ -1762,14 +2268,14 @@ def _certificato_xades(firma, certs) -> Tuple[Optional[x509.Certificate], Option
                     if dm is not None and dv is not None:
                         digest_attesi.append((_alg_hash_xml(dm.get("Algorithm", "")), "".join((dv.text or "").split())))
     if not digest_attesi:
-        return scelto, Controllo(nome, "none", "elemento SigningCertificate assente")
+        return scelto, Controllo(nome, "none", T("elemento SigningCertificate assente"))
     for algo, valore in digest_attesi:
         if not algo:
             continue
         for c in certs:
             if base64.b64encode(hashlib.new(algo, c.dump()).digest()).decode() == valore:
-                return c, Controllo(nome, "ok", "SigningCertificate corrisponde al certificato usato")
-    return scelto, Controllo(nome, "error", "SigningCertificate indica un certificato diverso da quello incluso")
+                return c, Controllo(nome, "ok", T("SigningCertificate corrisponde al certificato usato"))
+    return scelto, Controllo(nome, "error", T("SigningCertificate indica un certificato diverso da quello incluso"))
 
 
 async def analizza_xml(ris: RisultatoDoc, valida: bool = True):
@@ -1777,11 +2283,11 @@ async def analizza_xml(ris: RisultatoDoc, valida: bool = True):
         with open(ris.percorso, 'rb') as f:
             dati = f.read()
         if etree is None:
-            ris.errore = "Libreria lxml non disponibile"
+            ris.errore = T("Libreria lxml non disponibile")
             return
         radice = etree.fromstring(dati, _parser_xml())
     except Exception:
-        ris.errore = "XML malformato o non leggibile"
+        ris.errore = T("XML malformato o non leggibile")
         return
     if ris.dimensione < 30_000_000:
         ris.fattura = riepilogo_fattura(dati)
@@ -1797,11 +2303,11 @@ async def analizza_xml(ris: RisultatoDoc, valida: bool = True):
         for e in firma.iter():
             if isinstance(e.tag, str) and _loc(e.tag) == 'SigningTime' and e.text:
                 fi.data_firma = parse_iso(e.text)
-                fi.fonte_data = "Elemento SigningTime (XAdES)"
+                fi.fonte_data = T("Elemento SigningTime (XAdES)")
                 break
         if not certs:
-            fi.stato, fi.esito = "error", "Firma XML senza certificato del firmatario"
-            fi.controlli.append(Controllo("Certificato", "error", "non presente nella firma"))
+            fi.stato, fi.esito = "error", T("Firma XML senza certificato del firmatario")
+            fi.controlli.append(Controllo(T("Certificato"), "error", T("non presente nella firma")))
             ris.firme.append(fi)
             continue
         cert, legame = _certificato_xades(firma, certs)
@@ -1811,13 +2317,13 @@ async def analizza_xml(ris: RisultatoDoc, valida: bool = True):
         fi.algo_firma = (sm.get("Algorithm", "").rsplit("#", 1)[-1] if sm is not None else "")
         fi.algo_hash = (_alg_hash_xml(rm.get("Algorithm", "")) or "") if rm is not None else ""
         if not valida:
-            fi.esito = "Verifica non eseguita (solo estrazione)"
+            fi.esito = T("Verifica non eseguita (solo estrazione)")
             ris.firme.append(fi)
             continue
         fi.integrita, fi.integrita_msg, copre = verifica_xmldsig(firma, radice, dati, cert)
         fi.controlli.append(controllo_integrita(fi))
         if fi.integrita and copre is False:
-            fi.controlli.append(Controllo("Copertura", "warn", "la firma copre solo una parte del documento"))
+            fi.controlli.append(Controllo(T("Copertura"), "warn", T("la firma copre solo una parte del documento")))
         fi.controlli.append(legame)
         msg_marca = ""
         for e in firma.iter():
@@ -1830,17 +2336,20 @@ async def analizza_xml(ris: RisultatoDoc, valida: bool = True):
                     fi.marca_valida, istante, fi.marca_tsa, msg_marca = await verifica_marca(token, _c14n(sv, alg))
                     fi.marca_temporale = istante
                 except Exception as ex:
-                    fi.marca_valida, msg_marca = None, f"marca non leggibile ({type(ex).__name__})"
+                    fi.marca_valida, msg_marca = None, T("marca non leggibile ({errore})", errore=type(ex).__name__)
                 break
         fi.controlli.append(controllo_marca(fi, msg_marca))
         fi.controlli += await valida_certificato(cert, certs, fi.data_firma, fi.marca_temporale if fi.marca_valida else None)
         fi.controlli.append(controllo_algoritmi(fi, cert))
-        fi.controlli.append(controllo_tipo_certificato(cert))
+        fi.controlli.append(controllo_uso_chiave(cert))
         t = controllo_tempi(fi)
         if t is not None:
             fi.controlli.append(t)
         combina_esito(fi)
         ris.firme.append(fi)
+
+
+ARCHIVIO = ArchivioFiducia()      # qui: la lettura della Trusted List usa la verifica XAdES definita sopra
 
 
 # ============================================================ ORCHESTRATORE
@@ -1870,7 +2379,7 @@ async def analizza_file(path: str, valida: bool = True) -> RisultatoDoc:
         reale = _tipo_reale(path)
         if reale and reale != ext and not (reale == '.p7m' and ext == '.p7s'):
             if ext in ESTENSIONI_VERIFICA:
-                ris.note.append(f"L'estensione {ext} non corrisponde al contenuto: analizzato come {reale}")
+                ris.note.append(T("L'estensione {ext} non corrisponde al contenuto: analizzato come {reale}", ext=ext, reale=reale))
             ext = reale
         ris.formato = {'.p7m': 'CAdES', '.p7s': 'CAdES', '.pdf': 'PAdES', '.xml': 'XAdES'}.get(ext, '?')
         ris.sha256 = await asyncio.to_thread(sha256_file, path)
@@ -1881,11 +2390,11 @@ async def analizza_file(path: str, valida: bool = True) -> RisultatoDoc:
         elif ext == '.xml':
             await analizza_xml(ris, valida)
         else:
-            ris.errore = "Formato non supportato"
+            ris.errore = T("Formato non supportato")
     except PermissionError:
-        ris.errore = "Accesso al file negato"
+        ris.errore = T("Accesso al file negato")
     except Exception as e:
-        ris.errore = f"Errore imprevisto: {type(e).__name__}: {e}"
+        ris.errore = T("Errore imprevisto: {errore}", errore=f"{type(e).__name__}: {e}")
     ris.durata = time.time() - t0
     ris.finalizza()
     return ris
@@ -1893,122 +2402,144 @@ async def analizza_file(path: str, valida: bool = True) -> RisultatoDoc:
 
 # ============================================================ REPORT / EXPORT
 def report_testuale(r: RisultatoDoc) -> str:
-    L = [f"File: {r.nome}", f"Percorso: {r.percorso}", f"Formato: {r.formato}",
-         f"Dimensione: {fmt_size(r.dimensione)}", f"SHA-256: {r.sha256}",
-         f"Esito complessivo: {etichetta_doc(r)} - {r.esito}", f"Firme rilevate: {len(r.firme)}"]
+    L = [f"{T('File')}: {r.nome}", f"{T('Percorso')}: {r.percorso}", f"{T('Formato')}: {r.formato}",
+         f"{T('Dimensione')}: {fmt_size(r.dimensione)}", f"SHA-256: {r.sha256}",
+         f"{T('Esito complessivo')}: {etichetta_doc(r)} - {r.esito}", f"{T('Firme rilevate')}: {len(r.firme)}"]
     if r.nome_contenuto and r.formato == 'CAdES':
-        L.append(f"Documento contenuto: {r.nome_contenuto} ({r.tipo_contenuto})")
+        L.append(f"{T('Documento contenuto')}: {r.nome_contenuto} ({T(r.tipo_contenuto)})")
     if r.estr_esito:
-        L.append(f"Estrazione: {ETICHETTA_ESTRAZIONE[r.estr_esito]} - {r.estr_dettaglio}")
-    L += [f"Nota: {n}" for n in r.note]
+        L.append(f"{T('Estrazione')}: {ETICHETTA_ESTRAZIONE[r.estr_esito]} - {r.estr_dettaglio}")
+    L += [f"{T('Nota')}: {n}" for n in r.note]
     for i, f in enumerate(r.firme, 1):
-        L += ["", f"--- {f.tipo} {i} ---", f"Firmatario: {f.firmatario}"]
+        L += ["", f"--- {T(f.tipo)} {i} ---", f"{T('Firmatario')}: {f.firmatario}"]
         if f.identificativo:
-            L.append(f"Identificativo: {f.identificativo}")
+            L.append(f"{T('Identificativo')}: {f.identificativo}")
         if f.organizzazione:
-            L.append(f"Organizzazione: {f.organizzazione}")
-        L.append(f"Data e ora firma: {fmt_dt(f.data_firma)}" + (f"  [{f.fonte_data}]" if f.fonte_data else ""))
+            L.append(f"{T('Organizzazione')}: {f.organizzazione}")
+        L.append(f"{T('Data e ora firma')}: {fmt_dt(f.data_firma)}" + (f"  [{f.fonte_data}]" if f.fonte_data else ""))
         if f.data_pdf_m:
-            L.append(f"Data /M del PDF: {fmt_dt(f.data_pdf_m)}")
+            L.append(f"{T('Data /M del PDF')}: {fmt_dt(f.data_pdf_m)}")
         if f.marca_temporale:
-            L.append(f"Marca temporale: {fmt_dt(f.marca_temporale)}")
-        L += [f"Emittente: {f.emittente}", f"Certificato valido dal {fmt_data(f.valido_dal)} al {fmt_data(f.valido_al)}",
-              f"Esito: {etichetta_firma(f)} - {f.esito}", "Controlli:"]
+            L.append(f"{T('Marca temporale')}: {fmt_dt(f.marca_temporale)}")
+        L += [f"{T('Emittente')}: {f.emittente}",
+              T("Certificato valido dal {inizio} al {fine}", inizio=fmt_data(f.valido_dal), fine=fmt_data(f.valido_al)),
+              f"{T('Esito')}: {etichetta_firma(f)} - {f.esito}", f"{T('Controlli')}:"]
         simboli = {"ok": "[OK]", "warn": "[!!]", "error": "[KO]", "none": "[--]"}
         L += [f"  {simboli[c.stato]} {c.nome}: {c.dettaglio}" for c in f.controlli]
-        L += [f"Nota: {n}" for n in f.note]
-    L += ["", f"Verifica eseguita il {fmt_dt(datetime.datetime.now().astimezone())} con {APP_NAME} {APP_VERSION}"]
+        L += [f"{T('Nota')}: {n}" for n in f.note]
+    L += ["", T("Verifica eseguita il {data} con {app}", data=fmt_dt(datetime.datetime.now().astimezone()), app=f"{APP_NAME} {APP_VERSION}"),
+          f"{ARCHIVIO.tsl_descrizione}"]
     return "\n".join(L)
 
 
 def esporta_csv(risultati: List[RisultatoDoc], path: str):
     with open(path, 'w', newline='', encoding='utf-8-sig') as f:
         w = csv.writer(f, delimiter=';')
-        w.writerow(["File", "Percorso", "Formato", "Dimensione", "SHA-256", "Stato documento", "Esito documento", "Estrazione",
-                    "Documento estratto", "N. firme", "Tipo", "Firmatario", "Identificativo", "Organizzazione", "Data firma",
-                    "Ora firma", "Fonte data", "Marca temporale", "Marca valida", "Cert. valido dal", "Cert. valido al",
-                    "Emittente", "Integrita'", "Esito firma", "Controlli"])
+        w.writerow([T(x) for x in ("File", "Percorso", "Formato", "Dimensione", "SHA-256", "Stato documento", "Esito documento",
+                                   "Estrazione", "Documento estratto", "N. firme", "Tipo", "Firmatario", "Identificativo",
+                                   "Organizzazione", "Data firma", "Ora firma", "Fonte data", "Marca temporale", "Marca valida",
+                                   "Cert. valido dal", "Cert. valido al", "Emittente", "Integrità", "Qualificazione eIDAS",
+                                   "Esito firma", "Controlli")])
         for r in risultati:
             base = [r.nome, r.percorso, r.formato, r.dimensione, r.sha256, etichetta_doc(r), r.esito,
                     ETICHETTA_ESTRAZIONE[r.estr_esito] if r.estr_esito else "", r.estr_dettaglio, len(r.firme)]
             if not r.firme:
-                w.writerow(base + [""] * 15)
+                w.writerow(base + [""] * 16)
             for fi in r.firme:
-                w.writerow(base + [fi.tipo, fi.firmatario, fi.identificativo, fi.organizzazione, fmt_data(fi.data_firma),
+                qualif = next((c.dettaglio for c in fi.controlli if c.codice == "qualificazione"), "")
+                w.writerow(base + [T(fi.tipo), fi.firmatario, fi.identificativo, fi.organizzazione, fmt_data(fi.data_firma),
                                    fmt_ora(fi.data_firma) if fi.data_firma else "", fi.fonte_data,
                                    fmt_dt(fi.marca_temporale) if fi.marca_temporale else "",
-                                   {True: "si", False: "no", None: ""}[fi.marca_valida],
+                                   {True: T("sì"), False: T("no"), None: ""}[fi.marca_valida],
                                    fmt_data(fi.valido_dal), fmt_data(fi.valido_al), fi.emittente,
-                                   {True: "verificata", False: "NON valida", None: "non verificabile"}[fi.integrita],
-                                   f"{etichetta_firma(fi)} - {fi.esito}",
+                                   {True: T("verificata"), False: T("NON valida"), None: T("non verificabile")}[fi.integrita],
+                                   qualif, f"{etichetta_firma(fi)} - {fi.esito}",
                                    " | ".join(f"{c.nome}: {c.dettaglio}" for c in fi.controlli)])
 
 
 def esporta_html(risultati: List[RisultatoDoc], path: str):
-    colori = {"ok": "#22A06B", "warn": "#E8A317", "error": "#E5484D", "none": "#8A94A6"}
+    colori = {"ok": "#11714D", "warn": "#E8A317", "error": "#B92C49", "none": "#5F6376"}
+    testo_badge = {"ok": "#fff", "warn": "#101828", "error": "#fff", "none": "#fff"}     # contrasto >= 4.5:1
+    colori_testo = {"ok": "#11714D", "warn": "#8A5800", "error": "#B92C49", "none": "#5F6376"}
     e = html.escape
     tot = {k: sum(1 for r in risultati if r.stato == k) for k in colori}
     righe = []
     for r in risultati:
-        estr = f"<br><small>Estrazione: {e(ETICHETTA_ESTRAZIONE[r.estr_esito])} · {e(r.estr_dettaglio)}</small>" if r.estr_esito else ""
-        righe.append(f"<tr class='doc'><td><span class='b' style='background:{colori[r.stato]}'>{e(etichetta_doc(r))}</span></td>"
-                     f"<td><b>{e(r.nome)}</b><br><small>{e(r.formato)} · {e(fmt_size(r.dimensione))}<br>SHA-256 {e(r.sha256[:32])}…</small>{estr}</td>"
+        estr = (f"<br><small>{e(T('Estrazione'))}: {e(ETICHETTA_ESTRAZIONE[r.estr_esito])} · {e(r.estr_dettaglio)}</small>"
+                if r.estr_esito else "")
+        righe.append(f"<tr class='doc'><td><span class='b' style='background:{colori[r.stato]};color:{testo_badge[r.stato]}'>"
+                     f"{e(etichetta_doc(r))}</span></td>"
+                     f"<th scope='row'><b>{e(r.nome)}</b><br><small>{e(r.formato)} · {e(fmt_size(r.dimensione))}<br>SHA-256 {e(r.sha256[:32])}…</small>{estr}</th>"
                      f"<td colspan='3'>{e(r.esito)}</td></tr>")
         for fi in r.firme:
-            controlli = "".join(f"<li style='color:{colori[c.stato]}'><span style='color:#344054'>{e(c.nome)}: {e(c.dettaglio)}</span></li>" for c in fi.controlli)
-            righe.append(f"<tr><td></td><td>↳ {e(fi.tipo)}: <b>{e(fi.firmatario)}</b><br><small>{e(fi.identificativo)}</small></td>"
+            simbolo = {"ok": "✓", "warn": "!", "error": "✕", "none": "–"}
+            controlli = "".join(f"<li><span aria-hidden='true' style='color:{colori_testo[c.stato]};font-weight:700'>{simbolo[c.stato]}</span> "
+                                f"<span class='sr'>{e(STATO_CONTROLLO[c.stato])}: </span>{e(c.nome)}: {e(c.dettaglio)}</li>" for c in fi.controlli)
+            righe.append(f"<tr><td></td><td>↳ {e(T(fi.tipo))}: <b>{e(fi.firmatario)}</b><br><small>{e(fi.identificativo)}</small></td>"
                          f"<td>{e(fmt_dt(fi.data_firma))}<br><small>{e(fi.fonte_data)}</small></td>"
-                         f"<td>{e(fi.emittente)}<br><small>valido {e(fmt_data(fi.valido_dal))} → {e(fmt_data(fi.valido_al))}</small></td>"
-                         f"<td><span class='b' style='background:{colori[fi.stato]}'>{e(etichetta_firma(fi))}</span> {e(fi.esito)}<ul>{controlli}</ul></td></tr>")
+                         f"<td>{e(fi.emittente)}<br><small>{e(T('valido'))} {e(fmt_data(fi.valido_dal))} → {e(fmt_data(fi.valido_al))}</small></td>"
+                         f"<td><span class='b' style='background:{colori[fi.stato]};color:{testo_badge[fi.stato]}'>{e(etichetta_firma(fi))}</span> "
+                         f"{e(fi.esito)}<ul>{controlli}</ul></td></tr>")
     ora = fmt_dt(datetime.datetime.now().astimezone())
-    doc = f"""<!doctype html><html lang="it"><head><meta charset="utf-8"><title>Report verifica firme</title>
+    titolo = T("Report di verifica firme")
+    doc = f"""<!doctype html><html lang="{LINGUA}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{e(titolo)}</title>
 <style>body{{font:14px Segoe UI,Arial,sans-serif;margin:32px;color:#101828;background:#f2f4f8}}
 h1{{color:#4C57CC;margin:0 0 4px}}table{{border-collapse:collapse;width:100%;background:#fff;border-radius:10px;overflow:hidden}}
 td,th{{padding:8px 10px;border-right:1px solid #e3e7ee;vertical-align:top;text-align:left}}th{{background:#13141B;color:#fff}}
 tr.doc td{{background:#f6f8fb}}.b{{color:#fff;border-radius:8px;padding:2px 8px;font-size:12px;font-weight:600}}
-small{{color:#667085}}ul{{margin:6px 0 0;padding-left:18px;font-size:12px}}.k{{display:inline-block;margin-right:18px;font-weight:600}}</style></head><body>
-<h1>Report di verifica firme</h1><p>Generato il {e(ora)} con {APP_NAME} {APP_VERSION}</p>
-<p><span class='k'>Totale: {len(risultati)}</span><span class='k' style='color:#22A06B'>Verificati: {tot['ok']}</span>
-<span class='k' style='color:#E8A317'>Attenzione: {tot['warn'] + tot['none']}</span><span class='k' style='color:#E5484D'>Non validi: {tot['error']}</span></p>
-<table><tr><th>Stato</th><th>Documento / firmatario</th><th>Data e ora firma</th><th>Emittente</th><th>Esito e controlli</th></tr>
-{''.join(righe)}</table></body></html>"""
+small{{color:#596173}}ul{{margin:6px 0 0;padding-left:18px;font-size:12px;list-style:none}}.k{{display:inline-block;margin-right:18px;font-weight:600}}
+th[scope=row]{{font-weight:400;background:#f6f8fb}}caption{{text-align:left;padding:0 0 8px;color:#596173}}
+.sr{{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}}</style></head><body><main>
+<h1>{e(titolo)}</h1><p>{e(T("Generato il {data} con {app}", data=ora, app=f"{APP_NAME} {APP_VERSION}"))} · {e(ARCHIVIO.tsl_descrizione)}</p>
+<p><span class='k'>{e(T("Totale"))}: {len(risultati)}</span><span class='k' style='color:{colori_testo["ok"]}'>{e(T("Verificati"))}: {tot['ok']}</span>
+<span class='k' style='color:{colori_testo["warn"]}'>{e(T("Attenzione"))}: {tot['warn'] + tot['none']}</span><span class='k' style='color:{colori_testo["error"]}'>{e(T("Non validi"))}: {tot['error']}</span></p>
+<table><caption>{e(titolo)}</caption><thead><tr><th scope='col'>{e(T("Stato"))}</th><th scope='col'>{e(T("Documento / firmatario"))}</th>
+<th scope='col'>{e(T("Data e ora firma"))}</th><th scope='col'>{e(T("Emittente"))}</th><th scope='col'>{e(T("Esito e controlli"))}</th></tr></thead>
+<tbody>{''.join(righe)}</tbody></table></main></body></html>"""
     with open(path, 'w', encoding='utf-8') as f:
         f.write(doc)
 
 
 def descrivi_certificato(der: bytes) -> str:
     c = x509.Certificate.load(der)
-    L = ["SOGGETTO", "  " + c.subject.human_friendly.replace("; ", "\n  "), "",
-         "EMITTENTE", "  " + c.issuer.human_friendly.replace("; ", "\n  "), "",
-         f"Numero di serie : {format(c.serial_number, 'X')}"]
+    def riga(chiave, valore):
+        L.append(f"{T(chiave):<16}: {valore}")
+
+    L = [T("SOGGETTO"), "  " + c.subject.human_friendly.replace("; ", "\n  "), "",
+         T("EMITTENTE"), "  " + c.issuer.human_friendly.replace("; ", "\n  "), ""]
+    riga("Numero di serie", format(c.serial_number, 'X'))
     try:
         v = c['tbs_certificate']['validity']
-        L.append(f"Valido dal      : {fmt_dt(v['not_before'].native)}")
-        L.append(f"Valido fino al  : {fmt_dt(v['not_after'].native)}")
+        riga("Valido dal", fmt_dt(v['not_before'].native))
+        riga("Valido fino al", fmt_dt(v['not_after'].native))
     except Exception:
         pass
     try:
-        L.append(f"Chiave pubblica : {c.public_key.algorithm.upper()} {c.public_key.bit_size} bit")
-        L.append(f"Algoritmo firma : {c.signature_algo} / {c.hash_algo}")
+        riga("Chiave pubblica", f"{c.public_key.algorithm.upper()} {c.public_key.bit_size} bit")
+        riga("Algoritmo firma", f"{c.signature_algo} / {c.hash_algo}")
     except Exception:
         pass
     try:
-        L.append(f"CA              : {'si' if c.ca else 'no'}")
+        riga("CA", T("sì") if c.ca else T("no"))
     except Exception:
         pass
-    for etichetta, attr in (("Uso chiave      ", 'key_usage_value'), ("Uso esteso      ", 'extended_key_usage_value')):
+    for chiave, attr in (("Uso chiave", 'key_usage_value'), ("Uso esteso", 'extended_key_usage_value')):
         try:
             val = getattr(c, attr)
             if val is not None:
-                L.append(f"{etichetta}: {', '.join(sorted(str(x) for x in val.native))}")
+                riga(chiave, ', '.join(sorted(str(x) for x in val.native)))
         except Exception:
             pass
     try:
         pol = [str(p['policy_identifier']) for p in c.certificate_policies_value.native]
         if pol:
-            L.append("Policy          : " + ", ".join(pol))
+            riga("Policy", ", ".join(pol))
     except Exception:
         pass
+    qc = info_qc(c)
+    if qc["qc"] or qc["qscd"] or qc["tipi"]:
+        tipi = {"esign": T("firma"), "eseal": T("sigillo"), "web": T("siti web")}
+        riga("QcStatements", ", ".join([T("qualificato")] * qc["qc"] + ["QSCD"] * qc["qscd"] + [tipi[t] for t in sorted(qc["tipi"])]))
     try:
         if c.ocsp_urls:
             L.append("OCSP            : " + ", ".join(c.ocsp_urls))
@@ -2021,26 +2552,79 @@ def descrivi_certificato(der: bytes) -> str:
         pass
     sha1, sha256 = hashlib.sha1(der).hexdigest().upper(), hashlib.sha256(der).hexdigest().upper()
     fp = lambda h: ":".join(h[i:i + 2] for i in range(0, len(h), 2))
-    L += ["", "IMPRONTE", f"  SHA-1   : {fp(sha1)}", f"  SHA-256 : {fp(sha256)}"]
+    L += ["", T("IMPRONTE"), f"  SHA-1   : {fp(sha1)}", f"  SHA-256 : {fp(sha256)}"]
     return "\n".join(L)
 
 
 # ============================================================ UI: TEMA
 C_SCURO = {"sfondo": "#13141B", "superficie": "#1A1B24", "rilievo": "#22232E", "hover": "#2A2C39", "bordo": "#2E303D",
-           "bordo_tenue": "#24252F", "testo": "#E8E9F0", "attenuato": "#A0A3B8", "tenue": "#6F7287", "accento": "#8E9DFF",
+           "bordo_tenue": "#24252F", "testo": "#E8E9F0", "attenuato": "#A0A3B8", "tenue": "#878A9D", "accento": "#8E9DFF",
            "accento_chiaro": "#A9B5FF", "accento_scuro": "#4C57CC", "accento_medio": "#6B79EE", "su_accento": "#0D0E15",
-           "selezione": "#2D3253", "ok": "#5CD3A0", "warn": "#F4C46A", "error": "#F2738D", "none": "#8E92A8", "info": "#7CC4F5",
+           "selezione": "#2D3253", "ok": "#5CD3A0", "warn": "#F4C46A", "error": "#F2758F", "none": "#989CB0", "info": "#7CC4F5",
            "riga_hover": "#232533", "carta_hover": "#1D1E29", "carta_bordo_hover": "#3B3E58", "sugg_sfondo": "#1E2033",
            "sugg_bordo": "#343A66", "pericolo_bordo": "#4E2E3A", "pericolo_hover": "#2E1F27", "barra": "#0E0F15",
            "zona_a": "#1E2034", "zona_b": "#181924", "cerchio": "#252842", "dettaglio": "#17181F", "scroll": "#3A3C50", "scroll_hover": "#545873"}
 C_CHIARO = {"sfondo": "#F3F4F9", "superficie": "#FFFFFF", "rilievo": "#EEF0F6", "hover": "#E3E6F0", "bordo": "#D5D8E3",
-            "bordo_tenue": "#E2E4EC", "testo": "#1B1D29", "attenuato": "#555970", "tenue": "#7B7F95", "accento": "#4C57CC",
+            "bordo_tenue": "#E2E4EC", "testo": "#1B1D29", "attenuato": "#555970", "tenue": "#676B80", "accento": "#4C57CC",
             "accento_chiaro": "#3F49B5", "accento_scuro": "#7C88EE", "accento_medio": "#6B79EE", "su_accento": "#FFFFFF",
-            "selezione": "#DDE1FA", "ok": "#14855A", "warn": "#A66A00", "error": "#C9304F", "none": "#6E7288", "info": "#1C74B8",
+            "selezione": "#DDE1FA", "ok": "#11714D", "warn": "#8A5800", "error": "#B92C49", "none": "#5F6376", "info": "#1967A4",
             "riga_hover": "#F0F2F9", "carta_hover": "#FAFAFE", "carta_bordo_hover": "#BFC4DC", "sugg_sfondo": "#EEF0FD",
             "sugg_bordo": "#C7CDF2", "pericolo_bordo": "#EDC3CD", "pericolo_hover": "#FBEDF0", "barra": "#E4E6EF",
             "zona_a": "#F4F5FF", "zona_b": "#FFFFFF", "cerchio": "#E4E7FB", "dettaglio": "#F7F8FC", "scroll": "#C4C7D6", "scroll_hover": "#A0A4B8"}
 C = dict(C_SCURO)
+
+
+# ============================================================ ACCESSIBILITA'
+def scala_testo_sistema() -> float:
+    """Impostazioni di Windows > Accessibilita' > Dimensioni testo (100-225%): Qt non la applica da solo."""
+    if sys.platform != "win32":
+        return 1.0
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Accessibility") as k:
+            valore = int(winreg.QueryValueEx(k, "TextScaleFactor")[0])
+        return min(max(valore, 100), 225) / 100.0
+    except Exception:
+        return 1.0
+
+
+def animazioni_di_sistema() -> bool:
+    """False se in Windows sono disattivati gli effetti di animazione (Accessibilita' > Effetti visivi)."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        attive = ctypes.c_int(1)
+        ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(attive), 0)     # SPI_GETCLIENTAREAANIMATION
+        return bool(attive.value)
+    except Exception:
+        return True
+
+
+SCALA_TESTO = scala_testo_sistema()
+
+
+def px(n: float) -> int:
+    return int(round(n * SCALA_TESTO))
+
+
+def animazioni_attive() -> bool:
+    return bool(IMP["animazioni"]) and animazioni_di_sistema()
+
+
+def accessibile(w, nome: str, descrizione: str = ""):
+    """Nome (e descrizione) letti dai lettori di schermo; restituisce il widget per comodita'."""
+    w.setAccessibleName(nome)
+    if descrizione:
+        w.setAccessibleDescription(descrizione)
+    return w
+
+
+def testo_semplice(html_testo: str) -> str:
+    """Versione testuale di un frammento HTML, per i lettori di schermo."""
+    t = re.sub(r"<br\s*/?>|</tr>|</li>", ". ", html_testo)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return re.sub(r"\s+", " ", html.unescape(t)).strip()
 
 ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
 <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A9B5FF"/><stop offset="1" stop-color="#6B79EE"/></linearGradient></defs>
@@ -2079,6 +2663,7 @@ _cache_icone = {}
 class _Bus(QObject):
     tema = pyqtSignal()
     tsl = pyqtSignal()
+    animazioni = pyqtSignal()
 
 
 BUS = _Bus()
@@ -2120,8 +2705,13 @@ def pallino(colore, lato=10) -> QIcon:
     return QIcon(pix)
 
 
-def pulsante(testo, nome_icona=None, ruolo=None, suggerimento=None):
+def pulsante(testo, nome_icona=None, ruolo=None, suggerimento=None, nome_accessibile=None):
     b = QPushButton(testo)
+    # focus solo da tastiera: con il mouse l'aspetto resta quello di sempre, con Tab il bordo evidenziato si vede
+    b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+    nome = nome_accessibile or testo.replace("…", "").strip() or (suggerimento or "")
+    if nome:
+        b.setAccessibleName(nome)
     if nome_icona:
         def imposta():
             if sip.isdeleted(b):
@@ -2152,16 +2742,16 @@ def foglio_stile() -> str:
     FONT = "'Segoe UI Variable Text', 'Segoe UI', 'Inter', sans-serif"
     return f"""
 * {{ outline: 0; }}
-QWidget {{ color: {C['testo']}; font-family: {FONT}; font-size: 13px; }}
+QWidget {{ color: {C['testo']}; font-family: {FONT}; font-size: {px(13)}px; }}
 QMainWindow, QDialog, QWidget#sfondo, QStackedWidget, QScrollArea {{ background-color: {C['sfondo']}; border: none; }}
 QLabel {{ background: transparent; }}
-QLabel#titolo {{ font-size: 26px; font-weight: 700; }}
-QLabel#titoloMedio {{ font-size: 17px; font-weight: 700; }}
-QLabel#sottotitolo {{ color: {C['attenuato']}; font-size: 14px; }}
-QLabel#etichetta {{ color: {C['tenue']}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
+QLabel#titolo {{ font-size: {px(26)}px; font-weight: 700; }}
+QLabel#titoloMedio {{ font-size: {px(17)}px; font-weight: 700; }}
+QLabel#sottotitolo {{ color: {C['attenuato']}; font-size: {px(14)}px; }}
+QLabel#etichetta {{ color: {C['tenue']}; font-size: {px(11)}px; font-weight: 700; letter-spacing: 1px; }}
 QLabel#attenuato {{ color: {C['attenuato']}; }}
-QLabel#marchio {{ font-size: 15px; font-weight: 700; }}
-QLabel#versione {{ color: {C['tenue']}; font-size: 12px; }}
+QLabel#marchio {{ font-size: {px(15)}px; font-weight: 700; }}
+QLabel#versione {{ color: {C['tenue']}; font-size: {px(12)}px; }}
 QWidget#barraTitolo {{ background-color: {C['superficie']}; border-bottom: 1px solid {C['bordo_tenue']}; }}
 QFrame#carta {{ background-color: {C['superficie']}; border: 1px solid {C['bordo_tenue']}; border-radius: 14px; }}
 QFrame#carta:hover {{ border-color: {C['carta_bordo_hover']}; background-color: {C['carta_hover']}; }}
@@ -2177,7 +2767,7 @@ QPushButton[ruolo~="pericolo"] {{ background-color: transparent; color: {C['erro
 QPushButton[ruolo~="pericolo"]:hover {{ background-color: {C['pericolo_hover']}; }}
 QPushButton[ruolo~="fantasma"] {{ background-color: transparent; border-color: transparent; color: {C['attenuato']}; }}
 QPushButton[ruolo~="fantasma"]:hover {{ background-color: {C['rilievo']}; color: {C['testo']}; }}
-QPushButton[ruolo~="piccolo"] {{ padding: 3px 10px; font-size: 12px; border-radius: 6px; }}
+QPushButton[ruolo~="piccolo"] {{ padding: 3px 10px; font-size: {px(12)}px; border-radius: 6px; }}
 QPushButton[ruolo~="filtro"] {{ background-color: transparent; border: 1px solid transparent; color: {C['attenuato']}; padding: 5px 12px; border-radius: 10px; }}
 QPushButton[ruolo~="filtro"]:hover {{ background-color: {C['rilievo']}; color: {C['testo']}; }}
 QPushButton[ruolo~="filtro"]:checked {{ background-color: {C['selezione']}; color: {C['testo']}; border-color: {C['accento_scuro']}; }}
@@ -2193,7 +2783,7 @@ QTreeWidget::item {{ padding: 0 8px; border: none; }}
 QTreeWidget::item:hover {{ background-color: {C['riga_hover']}; }}
 QTreeWidget::item:selected {{ background-color: {C['selezione']}; color: {C['testo']}; }}
 QHeaderView {{ background-color: transparent; }}
-QHeaderView::section {{ background-color: {C['superficie']}; color: {C['tenue']}; border: none; border-right: 1px solid {C['bordo']}; border-bottom: 1px solid {C['bordo']}; padding: 8px 10px; font-weight: 700; font-size: 12px; }}
+QHeaderView::section {{ background-color: {C['superficie']}; color: {C['tenue']}; border: none; border-right: 1px solid {C['bordo']}; border-bottom: 1px solid {C['bordo']}; padding: 8px 10px; font-weight: 700; font-size: {px(12)}px; }}
 QHeaderView::section:last {{ border-right: none; }}
 QCheckBox {{ spacing: 8px; }}
 QCheckBox::indicator {{ width: 15px; height: 15px; border-radius: 4px; border: 1px solid {C['bordo']}; background-color: {C['rilievo']}; }}
@@ -2219,6 +2809,15 @@ QProgressBar::chunk {{ border-radius: 7px; background-color: {C['accento_medio']
 QStatusBar {{ background-color: {C['superficie']}; color: {C['attenuato']}; border-top: 1px solid {C['bordo_tenue']}; }}
 QStatusBar::item {{ border: none; }}
 QToolTip {{ background-color: {C['rilievo']}; color: {C['testo']}; border: 1px solid {C['bordo']}; padding: 4px; }}
+/* focus da tastiera (WCAG 2.4.7): solo il colore del bordo cambia, nessuno spostamento del layout */
+QPushButton:focus, QPushButton[ruolo~="primario"]:focus, QPushButton[ruolo~="pericolo"]:focus, QPushButton[ruolo~="fantasma"]:focus,
+QPushButton[ruolo~="filtro"]:focus, QPushButton[ruolo~="filtro"]:checked:focus {{ border-color: {C['testo']}; }}
+QCheckBox:focus {{ color: {C['accento_chiaro']}; }}
+QCheckBox::indicator:focus {{ border-color: {C['testo']}; }}
+QTreeWidget:focus, QPlainTextEdit:focus, QTextBrowser:focus {{ border-color: {C['accento']}; }}
+QTabBar:focus {{ background-color: transparent; }}
+QTabBar::tab:focus {{ color: {C['testo']}; background-color: {C['rilievo']}; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
+QLabel[leggibile="true"]:focus {{ background-color: {C['rilievo']}; border-radius: 4px; }}
 """
 
 
@@ -2245,11 +2844,11 @@ def log_errore(testo):
 
 
 def avviso(parent, titolo, testo, tipo="info"):
-    {"info": QMessageBox.information, "warn": QMessageBox.warning, "error": QMessageBox.critical}[tipo](parent, titolo, testo)
+    {"info": QMessageBox.information, "warn": QMessageBox.warning, "error": QMessageBox.critical}[tipo](parent, T(titolo), testo)
 
 
 def conferma(parent, titolo, testo) -> bool:
-    return QMessageBox.question(parent, titolo, testo) == QMessageBox.StandardButton.Yes
+    return QMessageBox.question(parent, T(titolo), testo) == QMessageBox.StandardButton.Yes
 
 
 # ============================================================ UI: DIALOGHI
@@ -2257,25 +2856,29 @@ class DialogoCertificato(QDialog):
     def __init__(self, parent, fi: FirmaInfo):
         super().__init__(parent)
         self.fi = fi
-        self.setWindowTitle(f"Certificato · {fi.firmatario}")
+        self.setWindowTitle(T("Certificato · {nome}", nome=fi.firmatario))
         self.resize(720, 620)
         lay = QVBoxLayout(self)
-        lay.addWidget(etichetta("Dettagli del certificato", "titoloMedio"))
+        lay.addWidget(etichetta(T("Dettagli del certificato"), "titoloMedio"))
         try:
             self.testo = descrivi_certificato(fi.cert_der)
         except Exception as e:
-            self.testo = f"Impossibile decodificare il certificato: {e}"
+            self.testo = T("Impossibile decodificare il certificato: {errore}", errore=e)
         box = QPlainTextEdit(self.testo)
         box.setReadOnly(True)
-        box.setStyleSheet("font-family: Consolas, 'Courier New'; font-size: 12px;")
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard | Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.setStyleSheet(f"font-family: Consolas, 'Courier New'; font-size: {px(12)}px;")
+        accessibile(box, T("Dettagli del certificato"))
         lay.addWidget(box, 1)
         riga = QHBoxLayout()
-        for testo, ic, fn in (("Copia", "copia", self.copia), ("Esporta .cer / .pem…", "scarica", self.esporta), ("Apri con Windows", "apri", self.apri)):
+        for testo, ic, fn in ((T("Copia"), "copia", self.copia), (T("Esporta .cer / .pem…"), "scarica", self.esporta),
+                              (T("Apri con il sistema"), "apri", self.apri)):
             b = pulsante(testo, ic)
             b.clicked.connect(fn)
             riga.addWidget(b)
         riga.addStretch()
-        chiudi = pulsante("Chiudi", None, "primario")
+        chiudi = pulsante(T("Chiudi"), None, "primario")
+        chiudi.setDefault(True)
         chiudi.clicked.connect(self.accept)
         riga.addWidget(chiudi)
         lay.addLayout(riga)
@@ -2287,14 +2890,14 @@ class DialogoCertificato(QDialog):
         QApplication.clipboard().setText(self.testo)
 
     def esporta(self):
-        p, _ = QFileDialog.getSaveFileName(self, "Esporta certificato", f"Certificato_{self._base()}.cer",
-                                           "Certificato X.509 DER (*.cer);;Certificato PEM (*.pem)")
+        p, _ = QFileDialog.getSaveFileName(self, T("Esporta certificato"), f"{T('Certificato')}_{self._base()}.cer",
+                                           T("Certificato X.509 DER (*.cer);;Certificato PEM (*.pem)"))
         if p:
             try:
                 with open(p, 'wb') as f:
                     f.write(pem.armor('CERTIFICATE', self.fi.cert_der) if p.lower().endswith('.pem') else self.fi.cert_der)
             except OSError as e:
-                avviso(self, "Errore", f"Impossibile salvare: {e}", "error")
+                avviso(self, "Errore", T("Impossibile salvare: {errore}", errore=e), "error")
 
     def apri(self):
         p = os.path.join(tempfile.gettempdir(), f"cert_{self._base()}.cer")
@@ -2303,23 +2906,25 @@ class DialogoCertificato(QDialog):
                 f.write(self.fi.cert_der)
             apri_con_sistema(p)
         except OSError as e:
-            avviso(self, "Errore", f"Impossibile aprire: {e}", "error")
+            avviso(self, "Errore", T("Impossibile aprire: {errore}", errore=e), "error")
 
 
 class DialogoFattura(QDialog):
     def __init__(self, parent, nome, dati: dict):
         super().__init__(parent)
-        self.setWindowTitle("Riepilogo fattura elettronica")
+        self.setWindowTitle(T("Riepilogo fattura elettronica"))
         self.resize(560, 460)
         lay = QVBoxLayout(self)
-        lay.addWidget(etichetta("Fattura elettronica (FatturaPA)", "titoloMedio"))
+        lay.addWidget(etichetta(T("Fattura elettronica (FatturaPA)"), "titoloMedio"))
         lay.addWidget(etichetta(nome, "attenuato", True))
         righe = "".join(f"<tr><td style='color:{C['attenuato']};padding:4px 14px 4px 0'>{html.escape(k)}</td>"
                         f"<td style='padding:4px 0'><b>{html.escape(v)}</b></td></tr>" for k, v in dati.items())
         t = QTextBrowser()
         t.setHtml(f"<table>{righe}</table>")
+        accessibile(t, T("Fattura elettronica (FatturaPA)"), "; ".join(f"{k}: {v}" for k, v in dati.items()))
         lay.addWidget(t, 1)
-        b = pulsante("Chiudi", None, "primario")
+        b = pulsante(T("Chiudi"), None, "primario")
+        b.setDefault(True)
         b.clicked.connect(self.accept)
         lay.addWidget(b, 0, Qt.AlignmentFlag.AlignRight)
 
@@ -2327,22 +2932,25 @@ class DialogoFattura(QDialog):
 class DialogoAzione(QDialog):
     def __init__(self, parent, n, ci_sono_cartelle):
         super().__init__(parent)
-        self.setWindowTitle("Che cosa vuoi fare?")
+        self.setWindowTitle(T("Che cosa vuoi fare?"))
         self.setFixedWidth(500)
         self.azione = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 22, 24, 20)
         lay.setSpacing(12)
-        testo = "Cartelle e file rilasciati" if ci_sono_cartelle else f"{n} document{'o' if n == 1 else 'i'}"
+        testo = (T("Cartelle e file rilasciati") if ci_sono_cartelle else
+                 T("1 documento") if n == 1 else T("{n} documenti", n=n))
         lay.addWidget(etichetta(testo, "titoloMedio"))
-        lay.addWidget(etichetta("Scegli l'operazione. In entrambi i casi vedrai la tabella con firmatari ed esiti.", "attenuato", True))
-        self.sotto = QCheckBox("Includi le sottocartelle")
+        lay.addWidget(etichetta(T("Scegli l'operazione. In entrambi i casi vedrai la tabella con firmatari ed esiti."), "attenuato", True))
+        self.sotto = QCheckBox(T("Includi le sottocartelle"))
         self.sotto.setChecked(bool(IMP["sottocartelle"]))
         self.sotto.setVisible(ci_sono_cartelle)
         lay.addWidget(self.sotto)
         riga = QHBoxLayout()
-        v = pulsante("Verifica firme", "scudo", "primario")
-        e = pulsante("Estrai documenti", "pacco")
+        v = pulsante(T("Verifica firme"), "scudo", "primario")
+        e = pulsante(T("Estrai documenti"), "pacco")
+        v.setAutoDefault(True)
+        v.setDefault(True)          # Invio = verifica, Esc = annulla
         v.clicked.connect(lambda: self._scegli("verifica"))
         e.clicked.connect(lambda: self._scegli("estrai"))
         riga.addWidget(v)
@@ -2398,7 +3006,7 @@ class Elaborazione(QThread):
         except Exception:
             testo = traceback.format_exc()
             log_errore(testo)
-            self.errore.emit("Errore interno durante l'analisi (dettagli in errori.log)")
+            self.errore.emit(T("Errore interno durante l'analisi (dettagli in errori.log)"))
 
     async def _tutti(self):
         sem = asyncio.Semaphore(max(1, int(IMP["concorrenza"])))
@@ -2435,6 +3043,7 @@ class ZonaRilascio(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._passo)
+        BUS.animazioni.connect(self.aggiorna_animazione)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(30, 104, 30, 26)
         lay.setSpacing(6)
@@ -2442,9 +3051,11 @@ class ZonaRilascio(QWidget):
         s = etichetta(sottotitolo, "attenuato", True)
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         s.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        accessibile(self, titolo, sottotitolo)
         riga = QHBoxLayout()
         riga.addStretch()
-        b1, b2 = pulsante("Scegli i file…", "documento", "primario"), pulsante("Scegli una cartella…", "cartella")
+        b1 = pulsante(T("Scegli i file…"), "documento", "primario", T("Scegli uno o più documenti (Ctrl+O)"))
+        b2 = pulsante(T("Scegli una cartella…"), "cartella", None, T("Scegli una cartella intera (Ctrl+Maiusc+O)"))
         b1.clicked.connect(self.scegli_file)
         b2.clicked.connect(self.scegli_cartella)
         riga.addWidget(b1)
@@ -2461,8 +3072,17 @@ class ZonaRilascio(QWidget):
         self.update()
 
     def showEvent(self, e):
-        self._timer.start()
+        self.aggiorna_animazione()
         super().showEvent(e)
+
+    def aggiorna_animazione(self):
+        """Animazione continua solo se l'utente non l'ha disattivata (qui o in Windows): WCAG 2.2.2."""
+        if animazioni_attive() and self.isVisible():
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._fase = 0.0
+            self.update()
 
     def hideEvent(self, e):
         self._timer.stop()
@@ -2513,7 +3133,7 @@ class OverlayRilascio(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(QRectF(self.rect()).adjusted(20, 20, -20, -20), 18, 18)
         f = p.font()
-        f.setPointSize(18)
+        f.setPointSize(px(18))
         f.setBold(True)
         p.setFont(f)
         p.setPen(QColor(C["testo"]))
@@ -2565,6 +3185,13 @@ class AlberoEsiti(QTreeWidget):
         if self.parent() is not None and hasattr(self, "su_resize"):
             self.su_resize()
 
+    def keyPressEvent(self, e):
+        it = self.currentItem()
+        if it is not None and it.parent() is None and e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            it.setExpanded(not it.isExpanded())
+            return
+        super().keyPressEvent(e)
+
 
 SIMBOLO = {"ok": "✓", "warn": "!", "error": "✕", "none": "–"}
 
@@ -2582,10 +3209,10 @@ class PannelloDettaglio(QWidget):
         colonne = QHBoxLayout()
         colonne.setSpacing(24)
         self._blocchi = []
-        colonne.addLayout(self._blocco("CONTROLLI ESEGUITI", self._html_controlli(ris, fi)), 5)
+        colonne.addLayout(self._blocco(T("CONTROLLI ESEGUITI"), self._html_controlli(ris, fi), self._testo_controlli(ris, fi)), 5)
         if fi is not None:
-            colonne.addLayout(self._blocco("FIRMATARIO E CERTIFICATO", self._html_firma(fi)), 4)
-        colonne.addLayout(self._blocco("DOCUMENTO", self._html_doc(ris)), 4)
+            colonne.addLayout(self._blocco(T("FIRMATARIO E CERTIFICATO"), self._html_firma(fi)), 4)
+        colonne.addLayout(self._blocco(T("DOCUMENTO"), self._html_doc(ris)), 4)
         lay.addLayout(colonne)
         azioni = QHBoxLayout()
         azioni.setSpacing(6)
@@ -2595,26 +3222,30 @@ class PannelloDettaglio(QWidget):
             b.clicked.connect(fn)
             azioni.addWidget(b)
 
-        agg("Apri documento", "apri", lambda: lotto.apri(ris))
-        agg("Mostra nella cartella", "cartella", lambda: mostra_in_cartella(ris.percorso))
+        agg(T("Apri documento"), "apri", lambda: lotto.apri(ris))
+        agg(T("Mostra nella cartella"), "cartella", lambda: mostra_in_cartella(ris.percorso))
         if ris.formato == "CAdES" and not ris.errore:
-            agg("Estrai…", "scarica", lambda: lotto.estrai_singolo(ris))
+            agg(T("Estrai…"), "scarica", lambda: lotto.estrai_singolo(ris))
         if fi is not None and fi.cert_der:
-            agg("Certificato", "certificato", lambda: DialogoCertificato(lotto, fi).exec())
+            agg(T("Certificato"), "certificato", lambda: DialogoCertificato(lotto, fi).exec())
         if ris.fattura:
-            agg("Fattura", "fattura", lambda: DialogoFattura(lotto, ris.nome_contenuto or ris.nome, ris.fattura).exec())
-        agg("Copia report", "copia", lambda: lotto.copia(report_testuale(ris), "Report copiato negli appunti"))
+            agg(T("Fattura"), "fattura", lambda: DialogoFattura(lotto, ris.nome_contenuto or ris.nome, ris.fattura).exec())
+        agg(T("Copia report"), "copia", lambda: lotto.copia(report_testuale(ris), T("Report copiato negli appunti")))
         azioni.addStretch()
         lay.addLayout(azioni)
 
-    def _blocco(self, titolo, corpo):
+    def _blocco(self, titolo, corpo, descrizione=None):
         v = QVBoxLayout()
         v.setSpacing(4)
         v.addWidget(etichetta(titolo, "etichetta"))
         l = QLabel(corpo)
         l.setTextFormat(Qt.TextFormat.RichText)
         l.setWordWrap(True)
-        l.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # raggiungibile con Tab e letto per intero dai lettori di schermo (i simboli colorati diventano parole)
+        l.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        l.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        l.setProperty("leggibile", True)
+        accessibile(l, titolo.capitalize(), descrizione or testo_semplice(corpo))
         l.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         l.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         v.addWidget(l)
@@ -2622,9 +3253,15 @@ class PannelloDettaglio(QWidget):
         return v
 
     @staticmethod
+    def _testo_controlli(ris, fi):
+        if fi is None or not fi.controlli:
+            return (fi.esito if fi else ris.esito) or T("Nessun controllo eseguito")
+        return ". ".join(f"{STATO_CONTROLLO[c.stato]}: {c.nome}, {c.dettaglio}" for c in fi.controlli)
+
+    @staticmethod
     def _html_controlli(ris, fi):
         if fi is None or not fi.controlli:
-            motivo = html.escape((fi.esito if fi else ris.esito) or "Nessun controllo eseguito")
+            motivo = html.escape((fi.esito if fi else ris.esito) or T("Nessun controllo eseguito"))
             return f"<span style='color:{C[(fi.stato if fi else ris.stato)]}'>{motivo}</span>"
         r = "".join(f"<tr><td style='color:{C[c.stato]};font-weight:700;padding:1px 8px 3px 0'>{SIMBOLO[c.stato]}</td>"
                     f"<td style='padding:1px 0 3px 0'><b>{html.escape(c.nome)}</b> "
@@ -2638,21 +3275,23 @@ class PannelloDettaglio(QWidget):
         return f"<table cellspacing='0' cellpadding='0'>{r}</table>"
 
     def _html_firma(self, f):
-        return self._kv([("Tipo", f.tipo + (f" · busta livello {f.livello + 1}" if f.livello else "")), ("Firmatario", f.firmatario),
-                         ("Identificativo", f.identificativo), ("Organizzazione", f.organizzazione),
-                         ("Data di firma", fmt_dt(f.data_firma) if f.data_firma else "non presente"), ("Fonte della data", f.fonte_data),
-                         ("Data /M del PDF", fmt_dt(f.data_pdf_m) if f.data_pdf_m else ""),
-                         ("Marca temporale", fmt_dt(f.marca_temporale) if f.marca_temporale else ""), ("TSA", f.marca_tsa),
-                         ("Emesso da", f.emittente), ("Seriale", f.seriale),
-                         ("Validità", f"{fmt_data(f.valido_dal)} → {fmt_data(f.valido_al)}" if f.valido_dal else ""),
-                         ("Motivo", f.motivo), ("Luogo", f.luogo), ("Contatto", f.contatto), ("Campo PDF", f.campo)] + [("Nota", n) for n in f.note])
+        return self._kv([(T("Tipo"), T(f.tipo) + (" · " + T("busta livello {n}", n=f.livello + 1) if f.livello else "")),
+                         (T("Firmatario"), f.firmatario), (T("Identificativo"), f.identificativo), (T("Organizzazione"), f.organizzazione),
+                         (T("Data di firma"), fmt_dt(f.data_firma) if f.data_firma else T("non presente")), (T("Fonte della data"), f.fonte_data),
+                         (T("Data /M del PDF"), fmt_dt(f.data_pdf_m) if f.data_pdf_m else ""),
+                         (T("Marca temporale"), fmt_dt(f.marca_temporale) if f.marca_temporale else ""), ("TSA", f.marca_tsa),
+                         (T("Emesso da"), f.emittente), (T("Seriale"), f.seriale),
+                         (T("Validità"), f"{fmt_data(f.valido_dal)} → {fmt_data(f.valido_al)}" if f.valido_dal else ""),
+                         (T("Motivo"), f.motivo), (T("Luogo"), f.luogo), (T("Contatto"), f.contatto), (T("Campo PDF"), f.campo)]
+                        + [(T("Nota"), n) for n in f.note])
 
     def _html_doc(self, r):
-        return self._kv([("Percorso", r.percorso.replace("\\", "\\\u200b")), ("Formato", r.formato), ("Dimensione", fmt_size(r.dimensione)),
-                         ("Contiene", f"{r.nome_contenuto} ({r.tipo_contenuto})" if r.nome_contenuto and r.tipo_contenuto else r.nome_contenuto),
-                         ("Buste annidate", r.livelli + 1 if r.livelli else ""), ("SHA-256", f"{r.sha256[:32]} {r.sha256[32:]}"),
-                         ("Estrazione", f"{ETICHETTA_ESTRAZIONE[r.estr_esito]}: {r.estr_dettaglio}" if r.estr_esito else ""),
-                         ("Originale", "eliminato dopo l'estrazione" if r.originale_eliminato else "")] + [("Nota", n) for n in r.note])
+        return self._kv([(T("Percorso"), r.percorso.replace("\\", "\\\u200b")), (T("Formato"), r.formato),
+                         (T("Dimensione"), fmt_size(r.dimensione)),
+                         (T("Contiene"), f"{r.nome_contenuto} ({T(r.tipo_contenuto)})" if r.nome_contenuto and r.tipo_contenuto else r.nome_contenuto),
+                         (T("Buste annidate"), r.livelli + 1 if r.livelli else ""), ("SHA-256", f"{r.sha256[:32]} {r.sha256[32:]}"),
+                         (T("Estrazione"), f"{ETICHETTA_ESTRAZIONE[r.estr_esito]}: {r.estr_dettaglio}" if r.estr_esito else ""),
+                         (T("Originale"), T("eliminato dopo l'estrazione") if r.originale_eliminato else "")] + [(T("Nota"), n) for n in r.note])
 
     def adatta(self, larghezza) -> int:
         self.interno.setFixedWidth(larghezza)
@@ -2662,11 +3301,13 @@ class PannelloDettaglio(QWidget):
         return h
 
 
-COLONNE_CHI = [("firmatario", "Firmatario", 170), ("id", "Codice fiscale / ID", 170), ("data", "Data e ora firma", 150)]
-COLONNE_CERT = [("marca", "Marca temporale", 150), ("scad", "Certificato fino al", 120), ("ca", "Certificatore", 230), ("org", "Organizzazione", 160)]
-COLONNE_VERIFICA = [("esito", "Esito", 135), ("doc", "Documento", 230)] + COLONNE_CHI + [("motivo", "Perché", 480)] + COLONNE_CERT + [("fmt", "Formato", 70)]
-COLONNE_ESTRAI = [("esito", "Estrazione", 145), ("doc", "File originale", 210), ("estratto", "Estratto come", 170)] + COLONNE_CHI + \
-                 [("verifica", "Verifica firma", 105), ("motivo", "Perché", 420)] + COLONNE_CERT
+COLONNE_CHI = [("firmatario", T("Firmatario"), 170), ("id", T("Codice fiscale / ID"), 170), ("data", T("Data e ora firma"), 150)]
+COLONNE_CERT = [("marca", T("Marca temporale"), 150), ("scad", T("Certificato fino al"), 120), ("ca", T("Certificatore"), 230),
+                ("org", T("Organizzazione"), 160)]
+COLONNE_VERIFICA = ([("esito", T("Esito"), 135), ("doc", T("Documento"), 230)] + COLONNE_CHI + [("motivo", T("Perché"), 480)]
+                    + COLONNE_CERT + [("fmt", T("Formato"), 70)])
+COLONNE_ESTRAI = [("esito", T("Estrazione"), 145), ("doc", T("File originale"), 210), ("estratto", T("Estratto come"), 170)] + COLONNE_CHI + \
+                 [("verifica", T("Verifica firma"), 105), ("motivo", T("Perché"), 420)] + COLONNE_CERT
 
 
 class PannelloLotto(QWidget):
@@ -2711,26 +3352,27 @@ class PannelloLotto(QWidget):
         self._aggiorna_ico()
         titoli = QVBoxLayout()
         titoli.setSpacing(0)
-        titoli.addWidget(etichetta("Estrazione documenti" if self.estrai else "Verifica firme digitali", "titoloMedio"))
-        titoli.addWidget(etichetta("Estrae il contenuto dei .p7m con il nome pulito e mostra chi ha firmato" if self.estrai
-                                   else "CAdES (.p7m, .p7s), PAdES (.pdf), XAdES (.xml) e fatture elettroniche", "attenuato"))
+        titoli.addWidget(etichetta(T("Estrazione documenti") if self.estrai else T("Verifica firme digitali"), "titoloMedio"))
+        titoli.addWidget(etichetta(T("Estrae il contenuto dei .p7m con il nome pulito e mostra chi ha firmato") if self.estrai
+                                   else T("CAdES (.p7m, .p7s), PAdES (.pdf), XAdES (.xml) e fatture elettroniche"), "attenuato"))
         testa.addWidget(self.ico_testa)
         testa.addSpacing(6)
         testa.addLayout(titoli, 1)
-        b_file, b_cart = pulsante("Apri file…", "documento", "primario"), pulsante("Apri cartella…", "cartella")
+        b_file = pulsante(T("Apri file…"), "documento", "primario", T("Scegli uno o più documenti (Ctrl+O)"))
+        b_cart = pulsante(T("Apri cartella…"), "cartella", None, T("Scegli una cartella intera (Ctrl+Maiusc+O)"))
         b_file.clicked.connect(self.scegli_file)
         b_cart.clicked.connect(self.scegli_cartella)
-        self.b_report = pulsante("Report", "tabella")
+        self.b_report = pulsante(T("Report"), "tabella", None, T("Esporta i risultati in CSV (Excel) o in una pagina HTML"))
         m = QMenu(self)
-        m.addAction("Esporta CSV…", lambda: self._salva_report(".csv"))
-        m.addAction("Esporta HTML…", lambda: self._salva_report(".html"))
+        m.addAction(T("Esporta CSV…"), lambda: self._salva_report(".csv"))
+        m.addAction(T("Esporta HTML…"), lambda: self._salva_report(".html"))
         self.b_report.setMenu(m)
-        self.b_svuota = pulsante("Svuota", "cestino", "pericolo")
+        self.b_svuota = pulsante(T("Svuota"), "cestino", "pericolo", T("Toglie tutte le righe dalla tabella (i file non vengono toccati)"))
         self.b_svuota.clicked.connect(self.svuota)
         testa.addWidget(b_file)
         testa.addWidget(b_cart)
         if not self.estrai:
-            self.b_estrai = pulsante("Estrai documenti", "scarica", suggerimento="Estrae i .p7m selezionati, o tutti se non ne selezioni")
+            self.b_estrai = pulsante(T("Estrai documenti"), "scarica", suggerimento=T("Estrae i .p7m selezionati, o tutti se non ne selezioni"))
             self.b_estrai.clicked.connect(self._estrai_da_verifica)
             testa.addWidget(self.b_estrai)
         testa.addWidget(self.b_report)
@@ -2739,17 +3381,21 @@ class PannelloLotto(QWidget):
 
         if self.estrai:
             opz = QHBoxLayout()
-            opz.addWidget(etichetta("Destinazione:", "attenuato"))
+            lbl = etichetta(T("Destinazione:"), "attenuato")
+            opz.addWidget(lbl)
             self.lbl_dest = etichetta("", None)
+            lbl.setBuddy(self.lbl_dest)
             opz.addWidget(self.lbl_dest)
-            b1, b2 = pulsante("Scegli cartella…", "cartella", "piccolo"), pulsante("Accanto agli originali", None, "piccolo fantasma")
+            b1 = pulsante(T("Scegli cartella…"), "cartella", "piccolo", T("Cartella in cui salvare i documenti estratti"))
+            b2 = pulsante(T("Accanto agli originali"), None, "piccolo fantasma", T("Salva ogni documento nella cartella del suo .p7m"))
             b1.clicked.connect(self._scegli_dest)
             b2.clicked.connect(lambda: self._imposta_dest(""))
             opz.addWidget(b1)
             opz.addWidget(b2)
             opz.addStretch()
-            self.chk_verifica = QCheckBox("Verifica anche le firme")
-            self.chk_verifica.setToolTip("Se la togli, l'estrazione è più veloce: restano i dati del firmatario ma senza esito")
+            self.chk_verifica = QCheckBox(T("Verifica anche le firme"))
+            self.chk_verifica.setToolTip(T("Se la togli, l'estrazione è più veloce: restano i dati del firmatario ma senza esito"))
+            self.chk_verifica.setFocusPolicy(Qt.FocusPolicy.TabFocus)
             self.chk_verifica.setChecked(bool(IMP["verifica_in_estrazione"]))
             self.chk_verifica.toggled.connect(self._salva_verifica)
             opz.addWidget(self.chk_verifica)
@@ -2761,8 +3407,8 @@ class PannelloLotto(QWidget):
         self.gruppo = QButtonGroup(self)
         self.gruppo.setExclusive(True)
         self.chip = {}
-        voci = ([("all", "Tutti"), ("ok", "Estratti"), ("duplicato", "Già presenti"), ("errore", "Falliti")] if self.estrai else
-                [("all", "Tutti"), ("ok", "Verificati"), ("warn", "Attenzione"), ("error", "Non validi"), ("none", "Senza firma")])
+        voci = ([("all", T("Tutti")), ("ok", T("Estratti")), ("duplicato", T("Già presenti")), ("errore", T("Falliti"))] if self.estrai else
+                [("all", T("Tutti")), ("ok", T("Verificati")), ("warn", T("Attenzione")), ("error", T("Non validi")), ("none", T("Senza firma"))])
         self.voci = dict(voci)
         for k, t in voci:
             b = pulsante(f"{t}  0", None, "filtro")
@@ -2774,12 +3420,13 @@ class PannelloLotto(QWidget):
             filtri.addWidget(b)
         filtri.addSpacing(10)
         self.cerca = QLineEdit()
-        self.cerca.setPlaceholderText("Filtra per file, firmatario o codice fiscale…")
+        self.cerca.setPlaceholderText(T("Filtra per file, firmatario o codice fiscale…"))
+        accessibile(self.cerca, T("Filtra la tabella"), T("Filtra per file, firmatario o codice fiscale (Ctrl+F)"))
         self.cerca.setClearButtonEnabled(True)
         self.cerca.setAcceptDrops(False)
         self.cerca.textChanged.connect(lambda: self._timer_f.start())
         filtri.addWidget(self.cerca, 1)
-        b = pulsante("Espandi / comprimi", "espandi", "fantasma")
+        b = pulsante(T("Espandi / comprimi"), "espandi", "fantasma", T("Apre o chiude i dettagli di tutte le righe (su una riga: Invio)"))
         b.clicked.connect(self.alterna_tutti)
         filtri.addWidget(b)
         lay.addLayout(filtri)
@@ -2790,7 +3437,8 @@ class PannelloLotto(QWidget):
         self.lbl_stato = etichetta("", "attenuato")
         self.barra = QProgressBar()
         self.barra.setFixedWidth(240)
-        self.b_annulla = pulsante("Annulla", "chiudi", "piccolo pericolo")
+        accessibile(self.barra, T("Avanzamento"))
+        self.b_annulla = pulsante(T("Annulla"), "chiudi", "piccolo pericolo", T("Interrompe l'operazione in corso (Esc)"))
         self.b_annulla.clicked.connect(self.annulla)
         av.addWidget(self.lbl_stato, 1)
         av.addWidget(self.barra)
@@ -2799,12 +3447,13 @@ class PannelloLotto(QWidget):
         lay.addWidget(self.riga_av)
 
         self.pila = QStackedWidget()
-        self.zona = ZonaRilascio("Trascina qui i .p7m da estrarre" if self.estrai else "Trascina qui i documenti firmati",
-                                 "File o cartelle intere: la tabella si riempie mentre lavoro.")
+        self.zona = ZonaRilascio(T("Trascina qui i .p7m da estrarre") if self.estrai else T("Trascina qui i documenti firmati"),
+                                 T("File o cartelle intere: la tabella si riempie mentre lavoro."))
         self.zona.scegli_file.connect(self.scegli_file)
         self.zona.scegli_cartella.connect(self.scegli_cartella)
         self.pila.addWidget(self.zona)
         self.t = AlberoEsiti()
+        accessibile(self.t, T("Risultati"), T("Una riga per firma. Invio o Spazio aprono i dettagli, il tasto Menu apre le azioni."))
         self.t.setColumnCount(len(self.colonne))
         self.t.setHeaderLabels([c[1] for c in self.colonne])
         h = self.t.header()
@@ -2850,10 +3499,10 @@ class PannelloLotto(QWidget):
 
     def _imposta_dest(self, c):
         self.dest = c
-        self.lbl_dest.setText(c or "accanto ai file originali")
+        self.lbl_dest.setText(c or T("accanto ai file originali"))
 
     def _scegli_dest(self):
-        c = QFileDialog.getExistingDirectory(self, "Cartella di destinazione", self.dest or IMP["ultima_cartella"] or "")
+        c = QFileDialog.getExistingDirectory(self, T("Cartella di destinazione"), self.dest or IMP["ultima_cartella"] or "")
         if c:
             self._imposta_dest(c)
 
@@ -2866,15 +3515,15 @@ class PannelloLotto(QWidget):
         return ESTENSIONI_ESTRAI if self.estrai else ESTENSIONI_VERIFICA
 
     def scegli_file(self):
-        filtro = "Buste P7M (*.p7m *.P7M *.p7m*)" if self.estrai else "Documenti firmati (*.p7m *.p7s *.pdf *.xml *.p7m*)"
-        percorsi, _ = QFileDialog.getOpenFileNames(self, "Scegli i documenti", IMP["ultima_cartella"] or "", filtro + ";;Tutti i file (*)")
+        filtro = T("Buste P7M (*.p7m *.P7M *.p7m*)") if self.estrai else T("Documenti firmati (*.p7m *.p7s *.pdf *.xml *.p7m*)")
+        percorsi, _ = QFileDialog.getOpenFileNames(self, T("Scegli i documenti"), IMP["ultima_cartella"] or "", filtro + ";;" + T("Tutti i file (*)"))
         if percorsi:
             IMP["ultima_cartella"] = os.path.dirname(percorsi[0])
             IMP.salva()
             self.carica(percorsi, [], True)
 
     def scegli_cartella(self):
-        c = QFileDialog.getExistingDirectory(self, "Scegli una cartella", IMP["ultima_cartella"] or "")
+        c = QFileDialog.getExistingDirectory(self, T("Scegli una cartella"), IMP["ultima_cartella"] or "")
         if c:
             IMP["ultima_cartella"] = c
             IMP.salva()
@@ -2885,15 +3534,15 @@ class PannelloLotto(QWidget):
 
     def carica(self, files, cartelle, ricorsiva):
         if self.occupato():
-            avviso(self, "Attendi", "C'è già un'operazione in corso in questa scheda.", "warn")
+            avviso(self, "Attendi", T("C'è già un'operazione in corso in questa scheda."), "warn")
             return
         files = [f for f in files if supportato(os.path.basename(f), self._estensioni) or not self.estrai]
         if cartelle:
             self._attesa = files
             self.scan = Scansione(cartelle, ricorsiva, self._estensioni, self)
-            self.scan.avanzamento.connect(lambda p, n: self.lbl_stato.setText(f"Cerco i file… {n} trovati · {tronca(p, 80)}"))
+            self.scan.avanzamento.connect(lambda p, n: self.lbl_stato.setText(T("Cerco i file… {n} trovati · {cartella}", n=n, cartella=tronca(p, 80))))
             self.scan.fine.connect(self._fine_scansione)
-            self.lbl_stato.setText("Cerco i file…")
+            self.lbl_stato.setText(T("Cerco i file…"))
             self.barra.setRange(0, 0)
             self.riga_av.show()
             self.scan.start()
@@ -2906,7 +3555,7 @@ class PannelloLotto(QWidget):
         tutti = list(dict.fromkeys(self._attesa + trovati))
         if not tutti:
             if not self.scan.stop.is_set():
-                avviso(self, "Nessun file", "Nessun documento supportato trovato.", "warn")
+                avviso(self, "Nessun file", T("Nessun documento supportato trovato."), "warn")
             return
         self.avvia(tutti)
 
@@ -2914,16 +3563,16 @@ class PannelloLotto(QWidget):
         gia = {r.percorso for r in self.risultati}
         percorsi = [p for p in percorsi if p not in gia]
         if not percorsi:
-            avviso(self, "Nessun file da elaborare", "I documenti scelti non sono supportati o sono già in tabella.", "warn")
+            avviso(self, "Nessun file da elaborare", T("I documenti scelti non sono supportati o sono già in tabella."), "warn")
             return
         elimina = False
         if self.estrai and IMP["elimina_originale"]:
-            elimina = conferma(self, "Eliminare gli originali?", "Dopo ogni estrazione riuscita il .p7m originale verrà ELIMINATO definitivamente "
-                               "(mai se la firma risulta non valida). Confermi?")
+            elimina = conferma(self, "Eliminare gli originali?", T("Dopo ogni estrazione riuscita il .p7m originale verrà ELIMINATO "
+                                                                   "definitivamente (mai se la firma risulta non valida). Confermi?"))
         self.totale, self.fatti, self.t0 = len(percorsi), 0, time.time()
         self.lavoro = Elaborazione(percorsi, estrai=self.estrai, verifica=(not self.estrai) or self.chk_verifica.isChecked(),
                                    cartella_out=(self.dest or None) if self.estrai else None, elimina=elimina, parent=self)
-        self.lavoro.corrente.connect(lambda n: self.lbl_stato.setText(f"In corso: {tronca(n, 80)}"))
+        self.lavoro.corrente.connect(lambda n: self.lbl_stato.setText(T("In corso: {nome}", nome=tronca(n, 80))))
         self.lavoro.risultato.connect(self._su_risultato)
         self.lavoro.errore.connect(lambda m: avviso(self, "Errore", m, "error"))
         self.lavoro.finished.connect(self._fine)
@@ -2966,7 +3615,9 @@ class PannelloLotto(QWidget):
         self.riga_av.hide()
         self._aggiorna_azioni()
         self.ripopola()
-        self.messaggio.emit(f"{'Annullato' if annullato else 'Completato'}: {self.fatti} documenti in {trascorso:.1f} s")
+        testo = T("Annullato: {n} documenti in {s} s") if annullato else T("Completato: {n} documenti in {s} s")
+        self.messaggio.emit(testo.format(n=self.fatti, s=f"{trascorso:.1f}"))
+        self.barra.setAccessibleName(testo.format(n=self.fatti, s=f"{trascorso:.1f}"))
         if len(self.risultati) == 1 and self.t.topLevelItemCount():
             self.t.topLevelItem(0).setExpanded(True)
 
@@ -3079,14 +3730,14 @@ class PannelloLotto(QWidget):
 
     @staticmethod
     def _breve(d):
-        return dt_locale(d).strftime("%d/%m/%Y %H:%M:%S")
+        return dt_locale(d).strftime(FORMATO_DATA + " %H:%M:%S")
 
     def _testi(self, r, f, primo):
         v = {"doc": r.nome if primo else "↳", "fmt": r.formato if primo else "", "motivo": (f.esito if f else r.esito)}
         if f is not None:
-            v.update(firmatario=(f.firmatario + (" (controfirma)" if f.tipo == "Controfirma" else "")), org=f.organizzazione,
+            v.update(firmatario=(f.firmatario + (" (" + T("controfirma") + ")" if f.tipo == "Controfirma" else "")), org=f.organizzazione,
                      id=re.sub(r"^TINIT-", "", f.identificativo), ca=f.emittente,
-                     data=self._breve(f.data_firma) if f.data_firma else "non presente",
+                     data=self._breve(f.data_firma) if f.data_firma else T("non presente"),
                      marca=(self._breve(f.marca_temporale) if f.marca_temporale else "—"), scad=fmt_data(f.valido_al) if f.valido_al else "")
         if self.estrai:
             if primo:
@@ -3125,6 +3776,7 @@ class PannelloLotto(QWidget):
                 it.setForeground(self.chiavi.index("verifica"), QColor(C[f.stato if f else r.stato]))
             if not primo:
                 it.setForeground(1, QColor(C["tenue"]))
+                it.setData(1, Qt.ItemDataRole.AccessibleTextRole, T("altra firma dello stesso documento"))
             self.t.addTopLevelItem(it)
             figlio = QTreeWidgetItem(it)
             figlio.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -3165,7 +3817,7 @@ class PannelloLotto(QWidget):
         for i in range(n):
             self.t.topLevelItem(i).setExpanded(self.tutti_aperti)
         if self.tutti_aperti and self.t.topLevelItemCount() > 300:
-            self.messaggio.emit("Espanse le prime 300 righe")
+            self.messaggio.emit(T("Espanse le prime 300 righe"))
 
     def _selezionati(self):
         visti, out = set(), []
@@ -3179,34 +3831,38 @@ class PannelloLotto(QWidget):
 
     def _menu(self, pos):
         it = self.t.itemAt(pos)
+        if it is None:                     # da tastiera (tasto Menu, Maiusc+F10): la riga corrente
+            it = self.t.currentItem()
+            if it is not None:
+                pos = self.t.visualItemRect(it).center()
         if it is None or it.parent() is not None:
             return
         r, f = it.data(0, Qt.ItemDataRole.UserRole)
         m = QMenu(self)
-        m.addAction("Mostra dettagli", lambda: it.setExpanded(True))
-        m.addAction("Apri documento", lambda: self.apri(r))
-        m.addAction("Mostra nella cartella", lambda: mostra_in_cartella(r.percorso))
+        m.addAction(T("Mostra dettagli"), lambda: it.setExpanded(True))
+        m.addAction(T("Apri documento"), lambda: self.apri(r))
+        m.addAction(T("Mostra nella cartella"), lambda: mostra_in_cartella(r.percorso))
         if r.formato == "CAdES" and not r.errore:
-            m.addAction("Estrai…", lambda: self.estrai_singolo(r))
+            m.addAction(T("Estrai…"), lambda: self.estrai_singolo(r))
         m.addSeparator()
         if f is not None and f.cert_der:
-            m.addAction("Certificato…", lambda: DialogoCertificato(self, f).exec())
-            m.addAction("Copia impronta del certificato", lambda: self.copia(hashlib.sha256(f.cert_der).hexdigest().upper()))
+            m.addAction(T("Certificato…"), lambda: DialogoCertificato(self, f).exec())
+            m.addAction(T("Copia impronta del certificato"), lambda: self.copia(hashlib.sha256(f.cert_der).hexdigest().upper()))
         if f is not None:
-            m.addAction("Copia firmatario", lambda: self.copia(f.firmatario))
-        m.addAction("Copia report", lambda: self.copia(report_testuale(r), "Report copiato negli appunti"))
+            m.addAction(T("Copia firmatario"), lambda: self.copia(f.firmatario))
+        m.addAction(T("Copia report"), lambda: self.copia(report_testuale(r), T("Report copiato negli appunti")))
         m.exec(self.t.viewport().mapToGlobal(pos))
 
     # ---- azioni
-    def copia(self, testo, msg="Copiato negli appunti"):
+    def copia(self, testo, msg=None):
         QApplication.clipboard().setText(testo)
-        self.messaggio.emit(msg)
+        self.messaggio.emit(msg or T("Copiato negli appunti"))
 
     def apri(self, r: RisultatoDoc):
         try:
             if r.formato == "CAdES" and not r.errore and not (r.estr_esito in ("ok", "duplicato") and r.originale_eliminato):
                 dati = leggi_contenuto_p7m(r.percorso)
-                tmp = os.path.join(tempfile.gettempdir(), f"p7m_{r.sha256[:8]}_{r.nome_contenuto or 'documento'}")
+                tmp = os.path.join(tempfile.gettempdir(), f"p7m_{r.sha256[:8]}_{r.nome_contenuto or T('documento')}")
                 with open(tmp, 'wb') as f:
                     f.write(dati)
                 apri_con_sistema(tmp)
@@ -3215,21 +3871,21 @@ class PannelloLotto(QWidget):
             else:
                 apri_con_sistema(r.percorso)
         except Exception as e:
-            avviso(self, "Errore", f"Impossibile aprire il file: {e}", "error")
+            avviso(self, "Errore", T("Impossibile aprire il file: {errore}", errore=e), "error")
 
     def estrai_singolo(self, r: RisultatoDoc):
         iniziale = os.path.join(os.path.dirname(r.percorso), r.nome_contenuto or pulisci_nome_file_globale(r.nome))
-        p, _ = QFileDialog.getSaveFileName(self, "Salva documento estratto", iniziale)
+        p, _ = QFileDialog.getSaveFileName(self, T("Salva documento estratto"), iniziale)
         if not p:
             return
         try:
             with open(p, 'wb') as f:
                 f.write(leggi_contenuto_p7m(r.percorso))
-            self.messaggio.emit("Documento estratto")
+            self.messaggio.emit(T("Documento estratto"))
         except PermissionError:
-            avviso(self, "Errore permessi", "Non hai i permessi per scrivere in questa posizione.", "error")
+            avviso(self, "Errore permessi", T("Non hai i permessi per scrivere in questa posizione."), "error")
         except Exception as e:
-            avviso(self, "Errore", f"Estrazione non riuscita: {e}", "error")
+            avviso(self, "Errore", T("Estrazione non riuscita: {errore}", errore=e), "error")
 
     def _estrai_da_verifica(self):
         lista = [r.percorso for r in (self._selezionati() or self.risultati) if r.formato == "CAdES" and not r.errore]
@@ -3238,19 +3894,20 @@ class PannelloLotto(QWidget):
 
     def _salva_report(self, ext):
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filtro = "CSV (Excel) (*.csv)" if ext == ".csv" else "Pagina HTML (*.html)"
-        p, _ = QFileDialog.getSaveFileName(self, "Salva report", f"Report_{self.modalita}_{ts}{ext}", filtro)
+        filtro = T("CSV (Excel) (*.csv)") if ext == ".csv" else T("Pagina HTML (*.html)")
+        nome_modo = T("estrazione") if self.estrai else T("verifica")
+        p, _ = QFileDialog.getSaveFileName(self, T("Salva report"), f"Report_{nome_modo}_{ts}{ext}", filtro)
         if not p:
             return
         try:
             (esporta_csv if ext == ".csv" else esporta_html)(self.risultati, p)
-            self.messaggio.emit("Report salvato")
+            self.messaggio.emit(T("Report salvato"))
             if ext == ".html":
                 apri_con_sistema(p)
         except PermissionError:
-            avviso(self, "Errore permessi", "Non hai i permessi per scrivere in questa posizione.", "error")
+            avviso(self, "Errore permessi", T("Non hai i permessi per scrivere in questa posizione."), "error")
         except Exception as e:
-            avviso(self, "Errore", f"Salvataggio non riuscito: {e}", "error")
+            avviso(self, "Errore", T("Salvataggio non riuscito: {errore}", errore=e), "error")
 
 
 # ============================================================ UI: SCHERMATA INIZIO
@@ -3267,6 +3924,7 @@ class CartaAzione(QFrame):
         testa.addWidget(self.ico)
         testa.addSpacing(4)
         testa.addWidget(etichetta(titolo, "titoloMedio"), 1)
+        accessibile(self, titolo, formato + ". " + " ".join(f"{i}. {p}" for i, p in enumerate(passi, 1)))
         self.fmt = etichetta(formato, None, True)
         self.istr = QLabel()
         self.istr.setWordWrap(True)
@@ -3276,7 +3934,7 @@ class CartaAzione(QFrame):
         lay.addWidget(self.istr, 1)
         riga = QHBoxLayout()
         for t, ic, fn in bottoni:
-            b = pulsante(t, ic, "piccolo")
+            b = pulsante(t, ic, "piccolo", nome_accessibile=f"{t.replace('…', '')} · {titolo}")
             b.clicked.connect(fn)
             riga.addWidget(b)
         riga.addStretch()
@@ -3309,29 +3967,33 @@ class SchedaInizio(QScrollArea):
         esterno.addStretch()
         lay = QVBoxLayout(colonna)
         lay.setSpacing(16)
-        lay.addWidget(etichetta("Benvenuto", "titolo"))
-        lay.addWidget(etichetta("Verifica le firme digitali ed estrai i documenti dalle buste .p7m, uno alla volta o a migliaia. "
-                                "I file restano sul tuo computer.", "sottotitolo", True))
-        zona = ZonaRilascio("Trascina qui i documenti firmati", "File o cartelle: .p7m, .p7s, PDF firmati, XML e fatture elettroniche. Poi scegli se verificare o estrarre.")
+        lay.addWidget(etichetta(T("Benvenuto"), "titolo"))
+        lay.addWidget(etichetta(T("Verifica le firme digitali ed estrai i documenti dalle buste .p7m, uno alla volta o a migliaia. "
+                                  "I file restano sul tuo computer."), "sottotitolo", True))
+        zona = ZonaRilascio(T("Trascina qui i documenti firmati"),
+                            T("File o cartelle: .p7m, .p7s, PDF firmati, XML e fatture elettroniche. Poi scegli se verificare o estrarre."))
         zona.scegli_file.connect(app.scegli_file_inizio)
         zona.scegli_cartella.connect(app.scegli_cartella_inizio)
         lay.addWidget(zona)
         lay.addSpacing(4)
-        lay.addWidget(etichetta("COSA VUOI FARE?", "etichetta"))
+        lay.addWidget(etichetta(T("COSA VUOI FARE?"), "etichetta"))
         v, e = app.verifica, app.estrazione
         carte = [
-            ("scudo", "Verifica firme", ".p7m · .p7s · .pdf · .xml",
-             ["Scegli i file o un'intera cartella.", "Integrità, catena, revoca e marca temporale per ogni firma.", "Espandi una riga per sapere il perché dell'esito."],
-             [("File…", "documento", lambda: (app.vai(v), v.scegli_file())), ("Cartella…", "cartella", lambda: (app.vai(v), v.scegli_cartella()))]),
-            ("pacco", "Estrai documenti", "Buste .p7m, anche annidate o in base64",
-             ["Scegli i .p7m o una cartella.", "Ogni documento esce con il nome pulito: niente più «.pdf (1) (1).p7m».", "In tabella vedi chi ha firmato e l'esito della verifica."],
-             [("File…", "documento", lambda: (app.vai(e), e.scegli_file())), ("Cartella…", "cartella", lambda: (app.vai(e), e.scegli_cartella()))]),
-            ("fattura", "Fatture elettroniche", "FatturaPA .xml e .xml.p7m",
-             ["Apri la fattura nella verifica.", "Espandi la riga e premi «Fattura».", "Cedente, numero, data e importo in un colpo d'occhio."],
-             [("Apri fattura…", "documento", lambda: (app.vai(v), v.scegli_file()))]),
-            ("certificato", "Certificati e fiducia", "Trusted List AgID · archivio di Windows",
-             ["La Trusted List si aggiorna a ogni avvio.", "Dal dettaglio apri o esporti ogni certificato.", "Le CA private si aggiungono nelle Impostazioni."],
-             [("Impostazioni", "ingranaggio", lambda: app.vai(app.impostazioni))]),
+            ("scudo", T("Verifica firme"), ".p7m · .p7s · .pdf · .xml",
+             [T("Scegli i file o un'intera cartella."), T("Integrità, catena, revoca, marca temporale e qualificazione eIDAS per ogni firma."),
+              T("Espandi una riga per sapere il perché dell'esito.")],
+             [(T("File…"), "documento", lambda: (app.vai(v), v.scegli_file())), (T("Cartella…"), "cartella", lambda: (app.vai(v), v.scegli_cartella()))]),
+            ("pacco", T("Estrai documenti"), T("Buste .p7m, anche annidate o in base64"),
+             [T("Scegli i .p7m o una cartella."), T("Ogni documento esce con il nome pulito: niente più «.pdf (1) (1).p7m»."),
+              T("In tabella vedi chi ha firmato e l'esito della verifica.")],
+             [(T("File…"), "documento", lambda: (app.vai(e), e.scegli_file())), (T("Cartella…"), "cartella", lambda: (app.vai(e), e.scegli_cartella()))]),
+            ("fattura", T("Fatture elettroniche"), T("FatturaPA .xml e .xml.p7m"),
+             [T("Apri la fattura nella verifica."), T("Espandi la riga e premi «Fattura»."), T("Cedente, numero, data e importo in un colpo d'occhio.")],
+             [(T("Apri fattura…"), "documento", lambda: (app.vai(v), v.scegli_file()))]),
+            ("certificato", T("Certificati e fiducia"), T("Trusted List AgID firmata · LOTL UE · archivio di Windows"),
+             [T("La Trusted List si aggiorna a ogni avvio e se ne verifica la firma."), T("Dal dettaglio apri o esporti ogni certificato."),
+              T("Le CA private si aggiungono nelle Impostazioni.")],
+             [(T("Impostazioni"), "ingranaggio", lambda: app.vai(app.impostazioni))]),
         ]
         griglia = QGridLayout()
         griglia.setSpacing(12)
@@ -3343,7 +4005,8 @@ class SchedaInizio(QScrollArea):
 
 # ============================================================ UI: SCHEDA IMPOSTAZIONI
 class SchedaImpostazioni(QScrollArea):
-    TEMI = {"Sistema": "System", "Chiaro": "Light", "Scuro": "Dark"}
+    TEMI = {T("Sistema"): "System", T("Chiaro"): "Light", T("Scuro"): "Dark"}
+    LINGUE = {T("Automatica (come il sistema)"): "auto", "Italiano": "it", "English": "en"}
     cambiate = pyqtSignal()
 
     def __init__(self):
@@ -3362,44 +4025,62 @@ class SchedaImpostazioni(QScrollArea):
         est.addStretch()
         self.lay = QVBoxLayout(col)
         self.lay.setSpacing(10)
-        self.lay.addWidget(etichetta("Impostazioni", "titolo"))
-        self.lay.addWidget(etichetta("Le modifiche si salvano da sole.", "attenuato"))
+        self.lay.addWidget(etichetta(T("Impostazioni"), "titolo"))
+        self.lay.addWidget(etichetta(T("Le modifiche si salvano da sole."), "attenuato"))
 
-        self._sezione("ASPETTO")
+        self._sezione(T("ASPETTO"))
         self.tema = QComboBox()
         self.tema.addItems(self.TEMI)
         inv = {v: k for k, v in self.TEMI.items()}
-        self.tema.setCurrentText(inv.get(IMP["tema"], "Sistema"))
+        self.tema.setCurrentText(inv.get(IMP["tema"], T("Sistema")))
         self.tema.currentTextChanged.connect(self._cambia_tema)
-        self._riga("Tema", self.tema)
+        self._riga(T("Tema"), self.tema)
+        self.lingua = QComboBox()
+        self.lingua.addItems(self.LINGUE)
+        inv = {v: k for k, v in self.LINGUE.items()}
+        self.lingua.setCurrentText(inv.get(IMP["lingua"], T("Automatica (come il sistema)")))
+        self.lingua.currentTextChanged.connect(self._cambia_lingua)
+        self._riga(T("Lingua"), self.lingua, T("La nuova lingua si applica al prossimo avvio."))
+        self._opzione("animazioni", T("Animazioni"), T("Animazione della zona di rilascio. Resta comunque spenta se in Windows sono "
+                                                       "disattivati gli effetti di animazione."))
 
-        self._sezione("VERIFICA")
-        self._opzione("revoca", "Controllo revoca OCSP / CRL", "Interroga online lo stato dei certificati. Se i server non rispondono l'esito diventa «Attenzione» e il motivo è indicato.")
-        self._opzione("valida_data_firma", "Valuta i certificati scaduti alla data di firma dichiarata", "Senza marca temporale il risultato resta «Attenzione»: la data dichiarata non è opponibile.")
+        self._sezione(T("VERIFICA"))
+        self._opzione("revoca", T("Controllo revoca OCSP / CRL"), T("Interroga online lo stato dei certificati. Se i server non rispondono "
+                                                                    "l'esito diventa «Attenzione» e il motivo è indicato."))
+        self._opzione("valida_data_firma", T("Valuta i certificati scaduti alla data di firma dichiarata"),
+                      T("Senza marca temporale il risultato resta «Attenzione»: la data dichiarata non è opponibile."))
         self.conc = QComboBox()
         self.conc.addItems([str(n) for n in range(1, 9)])
         self.conc.setCurrentText(str(int(IMP["concorrenza"])))
         self.conc.currentTextChanged.connect(lambda v: self._salva("concorrenza", int(v)))
-        self._riga("File elaborati in parallelo", self.conc)
+        self._riga(T("File elaborati in parallelo"), self.conc)
 
-        self._sezione("ESTRAZIONE")
-        self._opzione("estrai_annidati", "Apri le buste annidate", "Se un .p7m contiene un altro .p7m (doppia firma) estrae direttamente il documento finale.")
-        self._opzione("elimina_originale", "Elimina il .p7m dopo l'estrazione riuscita", "Viene chiesta conferma a ogni lotto. Gli originali con firma non valida non vengono mai eliminati.")
-        self._opzione("sottocartelle", "Includi le sottocartelle quando scegli una cartella", "")
+        self._sezione(T("ESTRAZIONE"))
+        self._opzione("estrai_annidati", T("Apri le buste annidate"),
+                      T("Se un .p7m contiene un altro .p7m (doppia firma) estrae direttamente il documento finale."))
+        self._opzione("elimina_originale", T("Elimina il .p7m dopo l'estrazione riuscita"),
+                      T("Viene chiesta conferma a ogni lotto. Gli originali con firma non valida non vengono mai eliminati."))
+        self._opzione("sottocartelle", T("Includi le sottocartelle quando scegli una cartella"), "")
         r = QHBoxLayout()
         self.out = QLineEdit(IMP["cartella_output"])
-        self.out.setPlaceholderText("Vuoto = accanto ai file originali")
+        self.out.setPlaceholderText(T("Vuoto = accanto ai file originali"))
+        accessibile(self.out, T("Cartella di destinazione predefinita"), T("Vuoto = accanto ai file originali"))
         self.out.editingFinished.connect(lambda: self._salva("cartella_output", self.out.text().strip()))
-        b = pulsante("Sfoglia…", "cartella")
+        b = pulsante(T("Sfoglia…"), "cartella", None, nome_accessibile=T("Sfoglia cartella di destinazione"))
         b.clicked.connect(self._sfoglia)
         r.addWidget(self.out, 1)
         r.addWidget(b)
-        self._blocco("Cartella di destinazione predefinita", r)
+        self._blocco(T("Cartella di destinazione predefinita"), r)
 
-        self._sezione("RADICI ATTENDIBILI")
+        self._sezione(T("RADICI ATTENDIBILI"))
         r = QHBoxLayout()
         self.lbl_radici = etichetta("", "attenuato", True)
-        ba, br, bt = pulsante("Aggiungi CA…", "certificato"), pulsante("Rimuovi aggiunte", None, "pericolo"), pulsante("Aggiorna Trusted List", "aggiorna")
+        self.lbl_radici.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        self.lbl_radici.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.lbl_radici.setProperty("leggibile", True)
+        ba = pulsante(T("Aggiungi CA…"), "certificato", None, T("Aggiunge certificati di CA private (.cer, .crt, .pem, .der) alle radici attendibili"))
+        br = pulsante(T("Rimuovi aggiunte"), None, "pericolo", T("Toglie tutte le CA aggiunte da te"))
+        bt = pulsante(T("Aggiorna Trusted List"), "aggiorna", None, T("Scarica di nuovo la Trusted List AgID e la LOTL europea"))
         ba.clicked.connect(self._aggiungi)
         br.clicked.connect(self._azzera)
         bt.clicked.connect(self._aggiorna_tsl)
@@ -3422,17 +4103,29 @@ class SchedaImpostazioni(QScrollArea):
         self.lay.addWidget(f)
         return f
 
-    def _riga(self, testo, w):
-        l = QHBoxLayout(self._carta())
-        l.setContentsMargins(14, 10, 14, 10)
-        l.addWidget(etichetta(testo), 1)
+    def _riga(self, testo, w, nota=""):
+        carta = self._carta()
+        esterno = QVBoxLayout(carta)
+        esterno.setContentsMargins(14, 10, 14, 10)
+        esterno.setSpacing(2)
+        l = QHBoxLayout()
+        lbl = etichetta(testo)
+        lbl.setBuddy(w)
+        accessibile(w, testo, nota)
+        l.addWidget(lbl, 1)
         l.addWidget(w)
+        esterno.addLayout(l)
+        if nota:
+            esterno.addWidget(etichetta(nota, "attenuato", True))
 
     def _opzione(self, chiave, titolo, descr):
         l = QVBoxLayout(self._carta())
         l.setContentsMargins(14, 10, 14, 10)
         l.setSpacing(2)
         c = QCheckBox(titolo)
+        c.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        if descr:
+            c.setAccessibleDescription(descr)
         c.setChecked(bool(IMP[chiave]))
         c.toggled.connect(lambda v, k=chiave: self._salva(k, bool(v)))
         l.addWidget(c)
@@ -3452,7 +4145,14 @@ class SchedaImpostazioni(QScrollArea):
         IMP[k] = v
         IMP.salva()
         ARCHIVIO.cache_validazione.clear()
+        if k == "animazioni":
+            BUS.animazioni.emit()
         self.cambiate.emit()
+
+    def _cambia_lingua(self, t):
+        IMP["lingua"] = self.LINGUE[t]
+        IMP.salva()
+        avviso(self, "Lingua", T("La nuova lingua si applica al prossimo avvio di P7MReader."), "info")
 
     def _cambia_tema(self, t):
         IMP["tema"] = self.TEMI[t]
@@ -3460,17 +4160,20 @@ class SchedaImpostazioni(QScrollArea):
         applica_tema()
 
     def _sfoglia(self):
-        c = QFileDialog.getExistingDirectory(self, "Cartella di destinazione", self.out.text())
+        c = QFileDialog.getExistingDirectory(self, T("Cartella di destinazione"), self.out.text())
         if c:
             self.out.setText(c)
             self._salva("cartella_output", c)
 
     def aggiorna_radici(self):
-        self.lbl_radici.setText(f"{len(ARCHIVIO.radici)} radici attendibili, di cui {len(IMP['radici_extra'])} file di CA aggiunti da te.\n"
-                                f"{ARCHIVIO.tsl_descrizione or 'Trusted List AgID non disponibile'}")
+        testo = "\n".join(x for x in (
+            T("{n} radici attendibili, di cui {m} file di CA aggiunti da te.", n=len(ARCHIVIO.radici), m=len(IMP['radici_extra'])),
+            ARCHIVIO.tsl_descrizione or T("Trusted List AgID non disponibile"), ARCHIVIO.tsl_dettaglio) if x)
+        self.lbl_radici.setText(testo)
+        self.lbl_radici.setAccessibleName(testo)
 
     def _aggiungi(self):
-        percorsi, _ = QFileDialog.getOpenFileNames(self, "Certificati CA", "", "Certificati (*.cer *.crt *.pem *.der)")
+        percorsi, _ = QFileDialog.getOpenFileNames(self, T("Certificati CA"), "", T("Certificati (*.cer *.crt *.pem *.der)"))
         extra = list(IMP["radici_extra"])
         for p in percorsi:
             try:
@@ -3478,7 +4181,7 @@ class SchedaImpostazioni(QScrollArea):
                 if p not in extra:
                     extra.append(p)
             except Exception:
-                avviso(self, "File non valido", f"{os.path.basename(p)} non è un certificato X.509 valido.", "error")
+                avviso(self, "File non valido", T("{nome} non è un certificato X.509 valido.", nome=os.path.basename(p)), "error")
         if extra != IMP["radici_extra"]:
             IMP["radici_extra"] = extra
             IMP.salva()
@@ -3500,8 +4203,11 @@ class SchedaImpostazioni(QScrollArea):
 
 def scarica_tsl_in_sottofondo():
     def lavoro():
-        ARCHIVIO.ricarica(True)
-        BUS.tsl.emit()
+        try:
+            ARCHIVIO.ricarica(True)
+            BUS.tsl.emit()
+        except Exception:                # rete assente o finestra gia' chiusa: si resta sulla copia locale
+            log_errore(traceback.format_exc())
     threading.Thread(target=lavoro, daemon=True).start()
 
 
@@ -3509,7 +4215,7 @@ def scarica_tsl_in_sottofondo():
 class Finestra(QMainWindow):
     def __init__(self, percorsi_avvio=None):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {APP_VERSION} · Verifica ed estrazione firme digitali")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION} · " + T("Verifica ed estrazione firme digitali"))
         self.setWindowIcon(icona_app())
         self.resize(1320, 860)
         self.setMinimumSize(980, 640)
@@ -3527,12 +4233,13 @@ class Finestra(QMainWindow):
         bl.setContentsMargins(16, 10, 16, 10)
         logo = QLabel()
         logo.setPixmap(icona_app().pixmap(30, 30))
+        accessibile(logo, "P7M Reader")
         bl.addWidget(logo)
         bl.addSpacing(4)
         bl.addWidget(etichetta("P7M Reader", "marchio"))
         bl.addWidget(etichetta(f"v{APP_VERSION}", "versione"))
         bl.addStretch()
-        self.b_tema = pulsante("", "luna", "fantasma", "Cambia tema chiaro / scuro")
+        self.b_tema = pulsante("", "luna", "fantasma", T("Cambia tema chiaro / scuro"), T("Cambia tema chiaro / scuro"))
         self.b_tema.clicked.connect(self.alterna_tema)
         bl.addWidget(self.b_tema)
         lay.addWidget(barra)
@@ -3543,11 +4250,14 @@ class Finestra(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.tabBar().setDrawBase(False)
+        self.tabs.tabBar().setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.inizio = SchedaInizio(self)
-        self._schede = [(self.inizio, "Inizio", "casa"), (self.verifica, "Verifica firme", "scudo"),
-                        (self.estrazione, "Estrazione", "pacco"), (self.impostazioni, "Impostazioni", "ingranaggio")]
-        for w, t, ic in self._schede:
+        self._schede = [(self.inizio, T("Inizio"), "casa"), (self.verifica, T("Verifica firme"), "scudo"),
+                        (self.estrazione, T("Estrazione"), "pacco"), (self.impostazioni, T("Impostazioni"), "ingranaggio")]
+        for i, (w, t, ic) in enumerate(self._schede):
             self.tabs.addTab(w, icona(ic, C["accento_chiaro"], 16), t)
+            self.tabs.setTabToolTip(i, f"{t} (Ctrl+{i + 1})")
+            accessibile(w, t)
         BUS.tema.connect(self._icone_schede)
         lay.addWidget(self.tabs, 1)
 
@@ -3560,9 +4270,49 @@ class Finestra(QMainWindow):
         BUS.tsl.connect(self.aggiorna_info)
         self.overlay = OverlayRilascio(centro)
         self.aggiorna_info()
+        self._scorciatoie()
+        # focus iniziale sul contenuto della scheda: nessun bordo di focus visibile finche' non si usa la tastiera
+        QTimer.singleShot(0, lambda: self.tabs.currentWidget().setFocus(Qt.FocusReason.OtherFocusReason))
+        self.tabs.currentChanged.connect(self._focus_scheda)
         scarica_tsl_in_sottofondo()
         if percorsi_avvio:
             QTimer.singleShot(300, lambda: self.gestisci_percorsi(percorsi_avvio))
+
+    def _scorciatoie(self):
+        """Tutto quello che si fa con il mouse si fa anche da tastiera (WCAG 2.1.1)."""
+        def lotto():
+            w = self.tabs.currentWidget()
+            return w if w in (self.verifica, self.estrazione) else None
+
+        def apri_file():
+            (lotto().scegli_file if lotto() else self.scegli_file_inizio)()
+
+        def apri_cartella():
+            (lotto().scegli_cartella if lotto() else self.scegli_cartella_inizio)()
+
+        def cerca():
+            if lotto() is None:
+                self.vai(self.verifica)
+            lotto().cerca.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            lotto().cerca.selectAll()
+
+        def annulla():
+            if lotto() is not None and lotto().occupato():
+                lotto().annulla()
+
+        voci = [("Ctrl+O", apri_file), ("Ctrl+Shift+O", apri_cartella), ("Ctrl+F", cerca), ("Escape", annulla)]
+        voci += [(f"Ctrl+{i + 1}", (lambda w=w: self.vai(w))) for i, (w, _t, _ic) in enumerate(self._schede)]
+        self._tasti = []
+        for tasti, fn in voci:
+            s = QShortcut(QKeySequence(tasti), self)
+            s.activated.connect(fn)
+            self._tasti.append(s)
+
+    def _focus_scheda(self, _indice):
+        """Cambiando scheda Qt darebbe il focus al primo pulsante (bordo evidenziato anche per chi usa il mouse):
+        lo si da' al contenitore, da cui Tab porta al primo controllo. Chi scorre le schede con le frecce resta li'."""
+        if not self.tabs.tabBar().hasFocus():
+            QTimer.singleShot(0, lambda: self.tabs.currentWidget().setFocus(Qt.FocusReason.OtherFocusReason))
 
     def _icone_schede(self):
         for i, (_w, _t, ic) in enumerate(self._schede):
@@ -3572,8 +4322,9 @@ class Finestra(QMainWindow):
         self.tabs.setCurrentWidget(w)
 
     def aggiorna_info(self):
-        self.lbl_info.setText(f"{len(ARCHIVIO.radici)} radici  ·  {ARCHIVIO.tsl_descrizione or 'Trusted List AgID non disponibile'}  ·  "
-                              f"revoca {'attiva' if IMP['revoca'] else 'disattivata'}")
+        self.lbl_info.setText(T("{n} radici", n=len(ARCHIVIO.radici)) + "  ·  " + (ARCHIVIO.tsl_descrizione or T("Trusted List AgID non disponibile"))
+                              + "  ·  " + (T("revoca attiva") if IMP['revoca'] else T("revoca disattivata")))
+        self.lbl_info.setToolTip(ARCHIVIO.tsl_dettaglio)
 
     def alterna_tema(self):
         IMP["tema"] = "Light" if C["sfondo"] == C_SCURO["sfondo"] else "Dark"
@@ -3585,15 +4336,15 @@ class Finestra(QMainWindow):
         self.impostazioni.tema.blockSignals(False)
 
     def scegli_file_inizio(self):
-        percorsi, _ = QFileDialog.getOpenFileNames(self, "Scegli i documenti", IMP["ultima_cartella"] or "",
-                                                   "Documenti firmati (*.p7m *.p7s *.pdf *.xml *.p7m*);;Tutti i file (*)")
+        percorsi, _ = QFileDialog.getOpenFileNames(self, T("Scegli i documenti"), IMP["ultima_cartella"] or "",
+                                                   T("Documenti firmati (*.p7m *.p7s *.pdf *.xml *.p7m*)") + ";;" + T("Tutti i file (*)"))
         if percorsi:
             IMP["ultima_cartella"] = os.path.dirname(percorsi[0])
             IMP.salva()
             self.gestisci_percorsi(percorsi)
 
     def scegli_cartella_inizio(self):
-        c = QFileDialog.getExistingDirectory(self, "Scegli una cartella", IMP["ultima_cartella"] or "")
+        c = QFileDialog.getExistingDirectory(self, T("Scegli una cartella"), IMP["ultima_cartella"] or "")
         if c:
             IMP["ultima_cartella"] = c
             IMP.salva()
@@ -3628,7 +4379,8 @@ class Finestra(QMainWindow):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
             corrente = self.tabs.currentWidget()
-            self.overlay.testo = {self.verifica: "Rilascia per verificare", self.estrazione: "Rilascia per estrarre"}.get(corrente, "Rilascia qui i documenti")
+            self.overlay.testo = {self.verifica: T("Rilascia per verificare"), self.estrazione: T("Rilascia per estrarre")}.get(
+                corrente, T("Rilascia qui i documenti"))
             self.overlay.setGeometry(self.centralWidget().rect())
             self.overlay.raise_()
             self.overlay.show()
@@ -3656,21 +4408,70 @@ def _eccezione_ui(tipo, valore, tb):
     log_errore(testo)
     sys.__stderr__ and sys.__stderr__.write(testo)
     try:
-        avviso(QApplication.activeWindow(), "Errore imprevisto", f"{tipo.__name__}: {valore}\n\nDettagli salvati in errori.log", "error")
+        avviso(QApplication.activeWindow(), "Errore imprevisto",
+               f"{tipo.__name__}: {valore}\n\n" + T("Dettagli salvati in {percorso}", percorso=os.path.join(cartella_config(), "errori.log")), "error")
     except Exception:
         pass
 
 
+def _traduzioni_qt(app):
+    """Pulsanti standard di Qt (Si/No, Annulla, finestre di scelta file) nella lingua dell'interfaccia."""
+    if LINGUA == "en":
+        return None
+    from PyQt6.QtCore import QTranslator, QLibraryInfo
+    tr = QTranslator(app)
+    for cartella in (QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath),
+                     os.path.join(getattr(sys, '_MEIPASS', ''), "PyQt6", "Qt6", "translations")):
+        if cartella and tr.load(f"qtbase_{LINGUA}", cartella):
+            app.installTranslator(tr)
+            return tr
+    return None
+
+
+def selftest() -> int:
+    """Per gli automatismi di build: moduli, Trusted List, interfaccia. 0 = tutto bene."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    esiti = []
+    try:
+        app = QApplication.instance() or QApplication(sys.argv[:1])
+        tr = _traduzioni_qt(app)
+        esiti.append(("Traduzioni Qt", LINGUA == "en" or tr is not None, f"qtbase_{LINGUA}"))
+        applica_tema()
+        # una copia della lista con firma alterata non viene mai caricata: se ci sono servizi, la lista e' integra
+        esiti.append(("Trusted List", bool(ARCHIVIO.servizi), ARCHIVIO.tsl_descrizione))
+        esiti.append(("Autenticita' lista", True, ARCHIVIO.tsl_dettaglio.replace("\n", " | ")))
+        esiti.append(("Radici", len(ARCHIVIO.radici) > 0, str(len(ARCHIVIO.radici))))
+        esiti.append(("Lingua", True, LINGUA))
+        f = Finestra([])
+        f.close()
+        esiti.append(("Interfaccia", True, "ok"))
+    except Exception:
+        esiti.append(("Eccezione", False, traceback.format_exc()))
+    testo = "\n".join(f"[{'OK' if ok else 'KO'}] {n}: {d}" for n, ok, d in esiti)
+    log_errore(f"selftest {APP_VERSION}\n{testo}")
+    if sys.stdout is not None:
+        print(testo)
+    return 0 if all(ok for _n, ok, _d in esiti) else 1
+
+
 def main():
+    if sys.stdout is None or sys.stderr is None:        # exe senza console: niente print che vadano in crash
+        nulla = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = sys.stdout or nulla
+        sys.stderr = sys.stderr or nulla
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("P7MReader.3")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"P7MReader.{APP_VERSION}")
         except Exception:
             pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setWindowIcon(icona_app())
+    _traduzioni_qt(app)                # il traduttore ha app come genitore: resta vivo quanto l'applicazione
     sys.excepthook = _eccezione_ui
     applica_tema()
     try:

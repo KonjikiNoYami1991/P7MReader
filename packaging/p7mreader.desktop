@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=P7MReader
+GenericName=Verifica firme digitali
+GenericName[en]=Digital signature verifier
+Comment=Verifica firme digitali CAdES, PAdES, XAdES ed estrae i documenti dalle buste .p7m
+Comment[en]=Verify CAdES, PAdES and XAdES digital signatures and extract documents from .p7m envelopes
+Exec=P7MReader %F
+Icon=p7mreader
+Terminal=false
+Categories=Office;Viewer;Security;
+MimeType=application/pkcs7-mime;application/pkcs7-signature;application/pdf;application/xml;
+Keywords=p7m;p7s;firma;signature;cades;pades;xades;eidas;fatturapa;
+StartupWMClass=P7MReader
