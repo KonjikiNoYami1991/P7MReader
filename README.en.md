@@ -31,7 +31,7 @@ sha256sum -c SHA256SUMS.txt --ignore-missing
 
 ## Linux
 
-There are two packages with the same program inside. They work on recent x86_64 distributions (glibc 2.35 or later: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, openSUSE Leap 15.5+ and similar). Neither needs administrator rights.
+There are two packages with the same program inside. They work on recent x86_64 distributions (glibc 2.35 or later: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, Arch, openSUSE Tumbleweed and Leap 15.6+, RHEL/AlmaLinux/Rocky 10 and similar; the [per-distribution table](#distribution-by-distribution) says what each one needs). Neither needs administrator rights.
 
 | Package | When to choose it |
 |---|---|
@@ -56,7 +56,7 @@ If it does not start and shows an error about **FUSE** (`libfuse.so.2`), install
 sudo apt install libfuse2t64
 ```
 
-(on Ubuntu 22.04 and Debian 12 the package is called `libfuse2`; on Fedora `sudo dnf install fuse-libs`). Or, without installing anything:
+(on Ubuntu 22.04 and Debian 12 the package is called `libfuse2`; for Fedora, Arch, openSUSE and the others see [distribution by distribution](#distribution-by-distribution)). Or, without installing anything:
 
 ```bash
 ./P7MReader-*-x86_64.AppImage --appimage-extract-and-run
@@ -108,6 +108,174 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 - **Update**: extract the new version's `.tar.gz` and run `./installa-linux.sh` again. It replaces the program and keeps your settings.
 - **Uninstall**: from the extracted folder, `./installa-linux.sh --rimuovi`. Settings and cache stay in `~/.config/P7MReader`: delete it by hand to remove everything.
 - **Without installing**: after extracting, you can run `./P7MReader/P7MReader` directly.
+
+### Distribution by distribution
+
+What you need, in short, on the main families. *Packages* = AppImage and tar.gz; *Source* = [running from source](#running-from-source-on-linux) with Python.
+
+| Family | Examples | Packages | Source |
+|---|---|---|---|
+| Debian / Ubuntu | Debian 12+, Ubuntu 22.04+, Mint 21+, Pop!_OS, elementary, Zorin | Yes | Yes (Debian 12 and Ubuntu 22.04: Python too old, use `uv`) |
+| Fedora | Fedora Workstation, KDE spin, Nobara | Yes | Yes |
+| Red Hat | RHEL, AlmaLinux, Rocky 10 | Yes | Yes |
+| Red Hat 9 | RHEL, AlmaLinux, Rocky 9 | **No** (glibc 2.34) | Yes, with `python3.12` |
+| Arch | Arch, Manjaro, EndeavourOS, CachyOS, Garuda | Yes | Yes |
+| openSUSE | Tumbleweed, Leap 15.6+ | Yes | Yes |
+| Others | Alpine, Void musl (musl, not glibc) | **No** | Yes |
+
+The packages already contain Python and Qt: from the system they need at most **FUSE 2** (AppImage only) and a few **X11 graphics libraries** that can be missing on minimal desktops. Running from source always needs the graphics libraries, because PyQt6 installed with `pip` takes them from the system.
+
+#### Debian, Ubuntu, Linux Mint and derivatives
+
+FUSE for the AppImage (Ubuntu 24.04+, Debian 13+, Mint 22+):
+
+```bash
+sudo apt install libfuse2t64
+```
+
+On Ubuntu 22.04, Debian 12 and Mint 21 the name is `libfuse2`:
+
+```bash
+sudo apt install libfuse2
+```
+
+Graphics libraries (if the `xcb` plugin error shows up, and always for running from source):
+
+```bash
+sudo apt install libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+```
+
+Running from source also needs:
+
+```bash
+sudo apt install python3-venv git
+```
+
+#### Fedora
+
+```bash
+sudo dnf install fuse-libs
+```
+
+```bash
+sudo dnf install mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+```
+
+For running from source (Python with `venv` is already included):
+
+```bash
+sudo dnf install python3 git
+```
+
+On **Fedora Atomic** (Silverblue, Kinoite, Bazzite…) the AppImage with *Gear Lever* is the easiest choice, or run from source inside `toolbox`.
+
+#### RHEL, AlmaLinux, Rocky Linux
+
+**Version 10** behaves like Fedora: same `dnf` commands as above.
+
+**Version 9** has glibc 2.34, older than the required 2.35: AppImage and tar.gz **do not start** (`GLIBC_2.35 not found` error). Run from source with Python 3.12 (available since 9.4):
+
+```bash
+sudo dnf install python3.12 git mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+```
+
+If `xcb-util-cursor` is not found, enable EPEL (`sudo dnf install epel-release`) and try again. In the [running from source](#running-from-source-on-linux) commands, write `python3.12` instead of `python3`.
+
+#### Arch Linux, Manjaro, EndeavourOS, CachyOS
+
+```bash
+sudo pacman -S --needed fuse2
+```
+
+```bash
+sudo pacman -S --needed libglvnd libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+```
+
+For running from source:
+
+```bash
+sudo pacman -S --needed python git
+```
+
+Arch does not allow `pip install` into the system Python (PEP 668): the virtual environment described below is the right way. There is also `python-pyhanko` on the AUR, but it can lag behind the version on PyPI.
+
+#### openSUSE Tumbleweed and Leap
+
+```bash
+sudo zypper install fuse libfuse2
+```
+
+```bash
+sudo zypper install libEGL1 libGL1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+```
+
+For running from source on Tumbleweed:
+
+```bash
+sudo zypper install python3 python3-pip git
+```
+
+On Leap 15.6 the default Python is 3.6: install 3.12 and use `python3.12` instead of `python3` in the commands below.
+
+```bash
+sudo zypper install python312 python312-pip git
+```
+
+#### Other distributions
+
+- **NixOS**: start the AppImage with `appimage-run` (`nix-shell -p appimage-run --run "appimage-run ./P7MReader-*-x86_64.AppImage"`).
+- **Alpine, Void musl** and other musl-based distributions: the packages do not work (they are built for glibc). Running from source remains, if the distribution provides PyQt6 for musl.
+- **ARM (aarch64, Raspberry Pi…)**: there are no prebuilt packages; running from source works where `pip` finds PyQt6 for that architecture.
+
+### Running from source on Linux
+
+After installing your distribution's system packages (see above):
+
+```bash
+git clone https://github.com/KonjikiNoYami1991/P7MReader.git
+```
+
+```bash
+cd P7MReader
+```
+
+```bash
+python3 -m venv .venv
+```
+
+```bash
+.venv/bin/pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
+```
+
+```bash
+.venv/bin/python P7MReader.py
+```
+
+To check that everything is fine, `.venv/bin/python P7MReader.py --selftest` ends with exit code 0 and prints `[OK]` for every check.
+
+**Python too old** (Debian 12, Ubuntu 22.04, Leap 15.x without `python312`…)? [`uv`](https://docs.astral.sh/uv/) downloads a recent Python into your user folder by itself, without touching the system one. Instead of the `venv` and `pip` commands:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```bash
+uv venv --python 3.13 .venv
+```
+
+```bash
+uv pip install --python .venv PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
+```
+
+Then start it as above, with `.venv/bin/python P7MReader.py`.
+
+**A `p7mreader` command** for the source version (optional), from the `P7MReader` folder:
+
+```bash
+mkdir -p ~/.local/bin && printf '#!/bin/sh\nexec "%s/.venv/bin/python" "%s/P7MReader.py" "$@"\n' "$PWD" "$PWD" > ~/.local/bin/p7mreader && chmod +x ~/.local/bin/p7mreader
+```
+
+**Updating**: `git pull` in the folder, then the `pip install` command again with `--upgrade`.
 
 ### If the program does not open
 
@@ -196,7 +364,7 @@ Designed following **WCAG 2.1 level AA**, without changing the look:
 
 ## Running from source
 
-Requires **Python 3.12+** (tested with 3.13 and 3.15).
+Requires **Python 3.12+** (tested with 3.13 and 3.15). On Linux follow [running from source on Linux](#running-from-source-on-linux), with the system packages for each distribution.
 
 ```bash
 pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi

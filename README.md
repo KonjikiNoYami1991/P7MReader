@@ -31,7 +31,7 @@ sha256sum -c SHA256SUMS.txt --ignore-missing
 
 ## Linux
 
-Ci sono due pacchetti, con lo stesso programma dentro. Funzionano su distribuzioni x86_64 recenti (glibc 2.35 o successiva: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, openSUSE Leap 15.5+ e simili). Nessuno dei due richiede permessi di amministratore.
+Ci sono due pacchetti, con lo stesso programma dentro. Funzionano su distribuzioni x86_64 recenti (glibc 2.35 o successiva: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, Arch, openSUSE Tumbleweed e Leap 15.6+, RHEL/AlmaLinux/Rocky 10 e simili; la [tabella per distribuzione](#distribuzione-per-distribuzione) dice cosa serve su ciascuna). Nessuno dei due richiede permessi di amministratore.
 
 | Pacchetto | Quando sceglierlo |
 |---|---|
@@ -56,7 +56,7 @@ Se non parte e compare un errore su **FUSE** (`libfuse.so.2`), installa la libre
 sudo apt install libfuse2t64
 ```
 
-(su Ubuntu 22.04 e Debian 12 il pacchetto si chiama `libfuse2`; su Fedora `sudo dnf install fuse-libs`). In alternativa, senza installare niente:
+(su Ubuntu 22.04 e Debian 12 il pacchetto si chiama `libfuse2`; per Fedora, Arch, openSUSE e le altre vedi [distribuzione per distribuzione](#distribuzione-per-distribuzione)). In alternativa, senza installare niente:
 
 ```bash
 ./P7MReader-*-x86_64.AppImage --appimage-extract-and-run
@@ -108,6 +108,174 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 - **Aggiornare**: estrai il `.tar.gz` della versione nuova e lancia di nuovo `./installa-linux.sh`. Sostituisce il programma e lascia intatte le impostazioni.
 - **Disinstallare**: dalla cartella estratta, `./installa-linux.sh --rimuovi`. Le impostazioni e la cache restano in `~/.config/P7MReader`: cancellala a mano se vuoi togliere tutto.
 - **Senza installare**: dopo l'estrazione si può avviare direttamente `./P7MReader/P7MReader`.
+
+### Distribuzione per distribuzione
+
+Cosa serve, in breve, sulle famiglie principali. *Pacchetti* = AppImage e tar.gz; *Sorgente* = [avvio da sorgente](#avvio-da-sorgente-su-linux) con Python.
+
+| Famiglia | Esempi | Pacchetti | Sorgente |
+|---|---|---|---|
+| Debian / Ubuntu | Debian 12+, Ubuntu 22.04+, Mint 21+, Pop!_OS, elementary, Zorin | Sì | Sì (Debian 12 e Ubuntu 22.04: Python troppo vecchio, usa `uv`) |
+| Fedora | Fedora Workstation, spin KDE, Nobara | Sì | Sì |
+| Red Hat | RHEL, AlmaLinux, Rocky 10 | Sì | Sì |
+| Red Hat 9 | RHEL, AlmaLinux, Rocky 9 | **No** (glibc 2.34) | Sì, con `python3.12` |
+| Arch | Arch, Manjaro, EndeavourOS, CachyOS, Garuda | Sì | Sì |
+| openSUSE | Tumbleweed, Leap 15.6+ | Sì | Sì |
+| Altre | Alpine, Void musl (musl, non glibc) | **No** | Sì |
+
+I pacchetti contengono già Python e Qt: di sistema servono al massimo **FUSE 2** (solo per l'AppImage) e qualche **libreria grafica X11** che su desktop minimali può mancare. Per l'avvio da sorgente le librerie grafiche servono sempre, perché PyQt6 installato con `pip` le prende dal sistema.
+
+#### Debian, Ubuntu, Linux Mint e derivate
+
+FUSE per l'AppImage (Ubuntu 24.04+, Debian 13+, Mint 22+):
+
+```bash
+sudo apt install libfuse2t64
+```
+
+Su Ubuntu 22.04, Debian 12 e Mint 21 il nome è `libfuse2`:
+
+```bash
+sudo apt install libfuse2
+```
+
+Librerie grafiche (se compare l'errore sul plugin `xcb`, e sempre per l'avvio da sorgente):
+
+```bash
+sudo apt install libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+```
+
+Per l'avvio da sorgente servono anche:
+
+```bash
+sudo apt install python3-venv git
+```
+
+#### Fedora
+
+```bash
+sudo dnf install fuse-libs
+```
+
+```bash
+sudo dnf install mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+```
+
+Per l'avvio da sorgente (Python con `venv` è già incluso):
+
+```bash
+sudo dnf install python3 git
+```
+
+Su **Fedora Atomic** (Silverblue, Kinoite, Bazzite…) conviene l'AppImage con *Gear Lever*, oppure l'avvio da sorgente dentro `toolbox`.
+
+#### RHEL, AlmaLinux, Rocky Linux
+
+Le **versioni 10** si comportano come Fedora: stessi comandi `dnf` qui sopra.
+
+Le **versioni 9** hanno glibc 2.34, più vecchia della 2.35 richiesta: AppImage e tar.gz **non partono** (errore `GLIBC_2.35 not found`). Si usa l'avvio da sorgente con Python 3.12 (disponibile dalla 9.4):
+
+```bash
+sudo dnf install python3.12 git mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+```
+
+Se `xcb-util-cursor` non viene trovato, attiva EPEL (`sudo dnf install epel-release`) e riprova. Nei comandi di [avvio da sorgente](#avvio-da-sorgente-su-linux) scrivi `python3.12` al posto di `python3`.
+
+#### Arch Linux, Manjaro, EndeavourOS, CachyOS
+
+```bash
+sudo pacman -S --needed fuse2
+```
+
+```bash
+sudo pacman -S --needed libglvnd libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-image xcb-util-keysyms xcb-util-renderutil
+```
+
+Per l'avvio da sorgente:
+
+```bash
+sudo pacman -S --needed python git
+```
+
+Arch non permette `pip install` nel Python di sistema (PEP 668): l'ambiente virtuale descritto sotto è il modo giusto. Esiste anche `python-pyhanko` su AUR, ma può essere indietro rispetto alla versione su PyPI.
+
+#### openSUSE Tumbleweed e Leap
+
+```bash
+sudo zypper install fuse libfuse2
+```
+
+```bash
+sudo zypper install libEGL1 libGL1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1
+```
+
+Per l'avvio da sorgente su Tumbleweed:
+
+```bash
+sudo zypper install python3 python3-pip git
+```
+
+Su Leap 15.6 il Python predefinito è il 3.6: installa il 3.12 e usa `python3.12` al posto di `python3` nei comandi sotto.
+
+```bash
+sudo zypper install python312 python312-pip git
+```
+
+#### Altre distribuzioni
+
+- **NixOS**: l'AppImage si avvia con `appimage-run` (`nix-shell -p appimage-run --run "appimage-run ./P7MReader-*-x86_64.AppImage"`).
+- **Alpine, Void musl** e altre distribuzioni basate su musl: i pacchetti non funzionano (sono compilati per glibc). Resta l'avvio da sorgente, se la distribuzione fornisce PyQt6 per musl.
+- **ARM (aarch64, Raspberry Pi…)**: non ci sono pacchetti precompilati; l'avvio da sorgente funziona dove `pip` trova PyQt6 per quell'architettura.
+
+### Avvio da sorgente su Linux
+
+Dopo aver installato i pacchetti di sistema della tua distribuzione (vedi sopra):
+
+```bash
+git clone https://github.com/KonjikiNoYami1991/P7MReader.git
+```
+
+```bash
+cd P7MReader
+```
+
+```bash
+python3 -m venv .venv
+```
+
+```bash
+.venv/bin/pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
+```
+
+```bash
+.venv/bin/python P7MReader.py
+```
+
+Per controllare che sia tutto a posto, `.venv/bin/python P7MReader.py --selftest` termina con codice 0 e stampa `[OK]` per ogni verifica.
+
+**Python troppo vecchio** (Debian 12, Ubuntu 22.04, Leap 15.x senza `python312`…)? [`uv`](https://docs.astral.sh/uv/) scarica da solo un Python recente nella cartella dell'utente, senza toccare quello di sistema. Al posto dei due comandi `venv` e `pip`:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```bash
+uv venv --python 3.13 .venv
+```
+
+```bash
+uv pip install --python .venv PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
+```
+
+Poi si avvia come sopra, con `.venv/bin/python P7MReader.py`.
+
+**Comando `p7mreader`** per l'avvio da sorgente (facoltativo), dalla cartella `P7MReader`:
+
+```bash
+mkdir -p ~/.local/bin && printf '#!/bin/sh\nexec "%s/.venv/bin/python" "%s/P7MReader.py" "$@"\n' "$PWD" "$PWD" > ~/.local/bin/p7mreader && chmod +x ~/.local/bin/p7mreader
+```
+
+**Aggiornare**: `git pull` nella cartella, poi di nuovo il comando `pip install` con `--upgrade`.
 
 ### Se il programma non si apre
 
@@ -196,7 +364,7 @@ Interfaccia pensata secondo le **WCAG 2.1 livello AA**, senza cambiare l'aspetto
 
 ## Avvio da sorgente
 
-Richiede **Python 3.12+** (testato con 3.13 e 3.15).
+Richiede **Python 3.12+** (testato con 3.13 e 3.15). Su Linux segui la guida [avvio da sorgente su Linux](#avvio-da-sorgente-su-linux), con i pacchetti di sistema per ogni distribuzione.
 
 ```bash
 pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi
