@@ -80,9 +80,9 @@ case "$ID" in
     ;;
   opensuse-tumbleweed|opensuse-leap|opensuse-slowroll)
     INST="zypper -n -q install"
-    BASE="curl tar gzip fontconfig libdbus-1-3 libglib-2_0-0 findutils"
+    BASE="curl tar gzip fontconfig libdbus-1-3 libglib-2_0-0 libgthread-2_0-0 findutils"
     FUSE="fuse3"
-    GRAFICA="libEGL1 libGL1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1"
+    GRAFICA="libglvnd libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1"
     SORGENTE="python3 python3-pip git"
     if [ "$ID" = opensuse-leap ] && [ "$MAGG" -lt 16 ]; then
         PY=python3.12

@@ -213,7 +213,7 @@ sudo zypper install fuse3
 ```
 
 ```bash
-sudo zypper install libEGL1 libGL1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1
+sudo zypper install libglvnd libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1
 ```
 
 Per l'avvio da sorgente su Tumbleweed e Leap 16:
