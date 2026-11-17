@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="P7MReader.png" alt="" width="96">
+  <img src="docs/social-preview.png" alt="P7MReader" width="100%">
 </p>
 
 <p align="center">
