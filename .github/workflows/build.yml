@@ -5,6 +5,8 @@ name: Build
 # - Tag "v*" (es. v3.1.0): oltre agli artifacts crea una Release con tutti i pacchetti allegati
 # - Avvio manuale con "release" compilato (es. v3.1.0): GitHub crea il tag sul commit compilato e la Release
 # - Chiamato da prove-sistemi.yml: compila e basta; i pacchetti vengono poi provati sulle varie distribuzioni
+# Le note della Release sono la sezione della versione nel changelog in testa a P7MReader.py (packaging/note_release.py):
+# senza quella sezione la Release non viene creata.
 on:
   workflow_dispatch:
     inputs:
@@ -112,6 +114,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+
+      - name: Note della release dal changelog di P7MReader.py
+        run: python3 packaging/note_release.py "${{ inputs.release || github.ref_name }}" > "$RUNNER_TEMP/note.md" && cat "$RUNNER_TEMP/note.md"
+
       - uses: actions/download-artifact@v8
         with:
           path: pacchetti
@@ -124,4 +131,6 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: P7MReader ${{ inputs.release || github.ref_name }}
           files: pacchetti/*
+          body_path: ${{ runner.temp }}/note.md
+          # le note del changelog vanno in testa, poi l'elenco automatico di GitHub (commit e "Full Changelog")
           generate_release_notes: true

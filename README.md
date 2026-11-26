@@ -471,6 +471,7 @@ macOS e Linux (`.app` + `.dmg`, oppure AppImage + `.tar.gz`):
 
 Le release si costruiscono da sole su GitHub Actions al push di un tag `v*` (es. `v3.1.0`) per Windows, macOS e Linux.
 A ogni compilazione la copia inclusa della Trusted List AgID viene sostituita con quella ufficiale, se più recente (`packaging/aggiorna_tsl.py`); senza rete resta quella presente.
+Il testo della release è la sezione della versione nel changelog in testa a `P7MReader.py` (`packaging/note_release.py`); per riscrivere le note di una release già pubblicata c'è il workflow *Note delle release*.
 
 ## Dove salva i dati
 
