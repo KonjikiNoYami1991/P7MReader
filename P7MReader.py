@@ -8,7 +8,7 @@ Dipendenze: PyQt6, pyhanko, pyhanko-certvalidator, asn1crypto, cryptography, lxm
 
 Changelog
 3.2.1 (2026-11-26)
-- Le note di ogni release sono la sezione della versione in questo changelog, seguita dall'elenco automatico
+- Le note di ogni release sono la sezione della versione nel changelog del programma, seguita dall'elenco automatico
   di GitHub; il workflow "Note delle release" riscrive il testo di una release gia' pubblicata
 - Build: rilanciare la release su un tag che esiste gia' ricompila il commit del tag (non l'ultimo di main)
   e sostituisce pacchetti, impronte e note invece di fallire
