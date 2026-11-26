@@ -1,5 +1,5 @@
 """
-P7MReader 3.1.2 - Verifica firme digitali ed estrazione documenti
+P7MReader 3.2.0 - Verifica firme digitali ed estrazione documenti
 Supporto: CAdES (.p7m, .p7s, anche annidati / base64), PAdES (.pdf), XAdES (.xml, fatture elettroniche)
 
 Uso:    python P7MReader.py [file o cartelle...]      python P7MReader.py --selftest
@@ -7,6 +7,14 @@ Build:  build_p7mreader.bat  (PyInstaller, P7MReader.spec)
 Dipendenze: PyQt6, pyhanko, pyhanko-certvalidator, asn1crypto, cryptography, lxml
 
 Changelog
+3.2.0 (2026-11-26)
+- Aggiunto: aggiornatore integrato. All'avvio (al massimo una volta al giorno, disattivabile) e con
+  Impostazioni -> Aggiornamenti -> Controlla ora cerca l'ultima release su GitHub, mostra le novita',
+  scarica il pacchetto per il sistema in uso, lo confronta con l'SHA-256 di SHA256SUMS.txt e si sostituisce
+  da solo con riavvio (exe Windows, AppImage, tar.gz installato, app macOS). Dove non puo' (sorgente,
+  cartella protetta, app aperta dal DMG) scarica il pacchetto verificato e lo mostra
+- packaging/prova_aggiornamento.py: prova automatica dell'aggiornatore su Windows, macOS e Linux
+
 3.1.2 (2026-11-26)
 - Pacchetti compilati con Python 3.14 e le librerie piu' recenti (PyQt6 6.12, pyhanko 0.38, cryptography 50, lxml 6.1)
 - La copia della Trusted List AgID inclusa si aggiorna da sola a ogni compilazione (se ne esiste una piu' recente)
@@ -62,6 +70,8 @@ import base64
 import hashlib
 import asyncio
 import zipfile
+import shutil
+import tarfile
 import tempfile
 import datetime
 import threading
@@ -74,14 +84,14 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from PyQt6 import sip
-from PyQt6.QtCore import Qt, QObject, QThread, QTimer, QSize, QRectF, QPointF, QByteArray, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QThread, QTimer, QSize, QRectF, QPointF, QByteArray, QUrl, pyqtSignal
 from PyQt6.QtGui import (QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF, QLinearGradient, QGuiApplication,
-                         QKeySequence, QShortcut)
+                         QKeySequence, QShortcut, QDesktopServices, QTextCursor)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton,
                              QLabel, QLineEdit, QFrame, QTabWidget, QScrollArea, QStackedWidget, QTreeWidget,
                              QTreeWidgetItem, QStyledItemDelegate, QHeaderView, QAbstractItemView, QProgressBar,
                              QCheckBox, QComboBox, QFileDialog, QMessageBox, QDialog, QPlainTextEdit,
-                             QMenu, QButtonGroup, QSizePolicy, QTextBrowser)
+                             QMenu, QButtonGroup, QSizePolicy, QTextBrowser, QProgressDialog)
 
 from asn1crypto import cms, x509, pem, tsp
 from asn1crypto import core as asn1core
@@ -121,7 +131,7 @@ for _nome_log in ("pyhanko", "pyhanko_certvalidator"):      # gli esiti li gesti
     logging.getLogger(_nome_log).setLevel(logging.CRITICAL)
 
 APP_NAME = "P7MReader"
-APP_VERSION = "3.1.2"
+APP_VERSION = "3.2.0"
 ESTENSIONI_VERIFICA = ('.p7m', '.p7s', '.pdf', '.xml')
 ESTENSIONI_ESTRAI = ('.p7m',)
 MAX_ANNIDAMENTO = 6
@@ -157,6 +167,9 @@ class Impostazioni:
         "colonne_estrai": "",
         "lingua": "auto",              # auto (segue Windows) / it / en
         "animazioni": True,            # animazioni della zona di rilascio (spente anche se Windows le disattiva)
+        "aggiornamenti_auto": True,    # all'avvio chiede a GitHub l'ultima versione (al massimo una volta al giorno)
+        "agg_ultimo_controllo": 0,     # istante dell'ultimo controllo (secondi)
+        "agg_ignorata": "",            # versione per cui l'utente ha scelto "Salta questa versione"
     }
 
     def __init__(self):
@@ -4103,6 +4116,18 @@ class SchedaImpostazioni(QScrollArea):
         r.addWidget(bt)
         r.addStretch()
         self._blocco("", r, self.lbl_radici)
+
+        self._sezione(T("AGGIORNAMENTI"))
+        self._opzione("aggiornamenti_auto", T("Controlla gli aggiornamenti all'avvio"),
+                      T("Al massimo una volta al giorno chiede a GitHub qual è l'ultima versione pubblicata. "
+                        "Non invia documenti né dati personali."))
+        r = QHBoxLayout()
+        self.lbl_agg = etichetta(T("Versione installata: {versione}.", versione=APP_VERSION), "attenuato", True)
+        self.lbl_agg.setProperty("leggibile", True)
+        self.b_agg = pulsante(T("Controlla ora"), "aggiorna", None, T("Cerca subito una nuova versione di P7MReader"))
+        r.addWidget(self.b_agg)
+        r.addStretch()
+        self._blocco("", r, self.lbl_agg)
         self.lay.addStretch()
         BUS.tsl.connect(self.aggiorna_radici)
         self.aggiorna_radici()
@@ -4214,6 +4239,11 @@ class SchedaImpostazioni(QScrollArea):
     def _aggiorna_tsl(self):
         scarica_tsl_in_sottofondo()
 
+    def stato_aggiornamenti(self, testo):
+        testo = T("Versione installata: {versione}.", versione=APP_VERSION) + " " + testo
+        self.lbl_agg.setText(testo)
+        self.lbl_agg.setAccessibleName(testo)
+
 
 def scarica_tsl_in_sottofondo():
     def lavoro():
@@ -4223,6 +4253,368 @@ def scarica_tsl_in_sottofondo():
         except Exception:                # rete assente o finestra gia' chiusa: si resta sulla copia locale
             log_errore(traceback.format_exc())
     threading.Thread(target=lavoro, daemon=True).start()
+
+
+# ============================================================ AGGIORNAMENTI
+# Ultima release pubblicata su GitHub -> pacchetto adatto a questo sistema -> SHA-256 confrontato con SHA256SUMS.txt
+# della stessa release -> sostituzione del programma e riavvio. Dove non si puo' sostituire (sorgente, cartella senza
+# permessi di scrittura, app aperta dal DMG) il pacchetto si scarica soltanto e viene mostrato nella cartella.
+REPO_GITHUB = "KonjikiNoYami1991/P7MReader"
+URL_ULTIMA_RELEASE = f"https://api.github.com/repos/{REPO_GITHUB}/releases/latest"
+URL_RELEASES = f"https://github.com/{REPO_GITHUB}/releases/latest"
+INTERVALLO_CONTROLLO = 24 * 3600          # controllo automatico al massimo una volta al giorno
+_SELFTEST = False
+
+
+def numeri_versione(v: str) -> Tuple[int, ...]:
+    """'v3.1.2' -> (3, 1, 2); il confronto ignora il prefisso e gli zeri finali."""
+    n = [int(x) for x in re.findall(r"\d+", v or "")[:4]]
+    while n and n[-1] == 0:
+        n.pop()
+    return tuple(n)
+
+
+def contesto_ssl() -> ssl.SSLContext:
+    """Certificati del sistema; se il sistema non ne fornisce (eseguibile macOS/Linux) quelli di certifi."""
+    ctx = ssl.create_default_context()
+    try:
+        if not ctx.cert_store_stats().get("x509_ca"):
+            import certifi
+            ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+def tipo_installazione() -> Tuple[str, str]:
+    """(modo, percorso da sostituire). modo: exe (Windows, un file), appimage, cartella (Linux tar.gz), app (macOS),
+    sorgente (python P7MReader.py) o manuale (pacchetto riconosciuto ma da sostituire a mano)."""
+    if not getattr(sys, "frozen", False):
+        return "sorgente", os.path.abspath(__file__)
+    exe = os.path.abspath(sys.executable)
+    if sys.platform == "win32":
+        # onefile: i file del programma stanno nella cartella temporanea _MEIxxxx, non accanto all'exe
+        interno = os.path.normcase(os.path.abspath(getattr(sys, "_MEIPASS", "")))
+        return ("exe", exe) if interno != os.path.normcase(os.path.dirname(exe)) and \
+            not os.path.isdir(os.path.join(os.path.dirname(exe), "_internal")) else ("manuale", exe)
+    if sys.platform == "darwin":
+        app = exe
+        while app != os.path.dirname(app) and not app.endswith(".app"):
+            app = os.path.dirname(app)
+        if not app.endswith(".app"):
+            return "manuale", exe
+        if "/AppTranslocation/" in app or app.startswith("/Volumes/"):
+            return "manuale", app          # app avviata dal DMG o "spostata" da Gatekeeper: si aggiorna a mano
+        return "app", app
+    if os.environ.get("APPIMAGE") and os.path.isfile(os.environ["APPIMAGE"]):
+        return "appimage", os.path.abspath(os.environ["APPIMAGE"])
+    return "cartella", os.path.dirname(exe)
+
+
+def suffisso_pacchetto() -> Optional[str]:
+    """Fine del nome del file della release adatto a questo sistema (None: nessun pacchetto, es. Linux non x86_64)."""
+    import platform
+    arch = platform.machine().lower()
+    if sys.platform == "win32":
+        return "-windows-x64.exe"
+    if sys.platform == "darwin":
+        return "-macOS-arm64.dmg" if arch in ("arm64", "aarch64") else "-macOS-x86_64.dmg"
+    if arch not in ("x86_64", "amd64"):
+        return None
+    return "-x86_64.AppImage" if tipo_installazione()[0] == "appimage" else "-linux-x86_64.tar.gz"
+
+
+def _scrivibile(cartella: str) -> bool:
+    try:
+        fd, p = tempfile.mkstemp(prefix=".p7mreader-prova-", dir=cartella)
+        os.close(fd)
+        os.remove(p)
+        return True
+    except Exception:
+        return False
+
+
+def puo_sostituirsi() -> bool:
+    modo, percorso = tipo_installazione()
+    if modo in ("sorgente", "manuale"):
+        return False
+    # il nuovo pacchetto si prepara accanto al vecchio (stesso disco: lo scambio finale e' un semplice rename)
+    return _scrivibile(os.path.dirname(percorso))
+
+
+def controlla_aggiornamenti(timeout: int = 15) -> dict:
+    """Interroga GitHub. Restituisce versione, se e' nuova, note, pagina e (se c'e') il pacchetto per questo sistema."""
+    req = urllib.request.Request(URL_ULTIMA_RELEASE, headers={
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout, context=contesto_ssl()) as r:
+        dati = json.loads(r.read(2 * 1024 * 1024).decode("utf-8"))
+    tag = str(dati.get("tag_name") or "")
+    risorse = {a.get("name", ""): a for a in dati.get("assets") or []}
+    suff = suffisso_pacchetto()
+    pacchetto = next((a for n, a in risorse.items() if suff and n.endswith(suff)), None)
+    impronte = risorse.get("SHA256SUMS.txt")
+    return {
+        "versione": tag.lstrip("vV"),
+        "tag": tag,
+        "nuova": numeri_versione(tag) > numeri_versione(APP_VERSION),
+        "note": str(dati.get("body") or "").strip(),
+        "pagina": dati.get("html_url") or URL_RELEASES,
+        "pacchetto": None if pacchetto is None else {
+            "nome": pacchetto["name"], "url": pacchetto["browser_download_url"], "dimensione": int(pacchetto.get("size") or 0)},
+        "impronte": impronte["browser_download_url"] if impronte else None,
+    }
+
+
+def impronta_attesa(url_impronte: str, nome: str) -> str:
+    """SHA-256 del file 'nome' secondo il SHA256SUMS.txt della release (formato di sha256sum)."""
+    req = urllib.request.Request(url_impronte, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=20, context=contesto_ssl()) as r:
+        testo = r.read(1024 * 1024).decode("utf-8", "replace")
+    for riga in testo.splitlines():
+        m = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$", riga)
+        if m and m.group(2) == nome:
+            return m.group(1).lower()
+    raise ValueError(T("impronta di {nome} assente in SHA256SUMS.txt", nome=nome))
+
+
+def scarica_verificato(info: dict, destinazione: str, avanzamento=None, fermo=None) -> str:
+    """Scarica il pacchetto in 'destinazione' (cartella) e ne controlla l'SHA-256. Restituisce il percorso del file."""
+    p = info["pacchetto"]
+    if not info.get("impronte"):
+        raise ValueError(T("la release non pubblica SHA256SUMS.txt: aggiornamento non verificabile"))
+    attesa = impronta_attesa(info["impronte"], p["nome"])
+    finale = os.path.join(destinazione, p["nome"])
+    if os.path.normcase(os.path.abspath(finale)) == os.path.normcase(tipo_installazione()[1]):
+        finale += ".nuovo"            # stesso nome del programma in uso: non lo si sovrascrive mentre gira
+    parziale = finale + ".download"
+    h = hashlib.sha256()
+    req = urllib.request.Request(p["url"], headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=contesto_ssl()) as r, open(parziale, "wb") as f:
+            totale = int(r.headers.get("Content-Length") or p["dimensione"] or 0)
+            fatti = 0
+            while True:
+                if fermo is not None and fermo.is_set():
+                    raise InterruptedError(T("download annullato"))
+                blocco = r.read(256 * 1024)
+                if not blocco:
+                    break
+                f.write(blocco)
+                h.update(blocco)
+                fatti += len(blocco)
+                if avanzamento:
+                    avanzamento(fatti, totale)
+        if h.hexdigest() != attesa:
+            raise ValueError(T("l'impronta SHA-256 del file scaricato non corrisponde a quella della release"))
+        os.replace(parziale, finale)
+    finally:
+        if os.path.exists(parziale):
+            try:
+                os.remove(parziale)
+            except OSError:
+                pass
+    return finale
+
+
+def _ambiente_pulito() -> dict:
+    """Ambiente per avviare la nuova versione: senza le variabili che PyInstaller e l'AppImage impostano per se'."""
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith(("_PYI", "_MEI")) or k in ("APPDIR", "APPIMAGE", "ARGV0", "OWD"):
+            env.pop(k, None)
+    for k in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        if k + "_ORIG" in env:
+            env[k] = env.pop(k + "_ORIG")
+        else:
+            env.pop(k, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # il nuovo eseguibile parte da zero, non come figlio di questo
+    return env
+
+
+def _avvia_staccato(comando: List[str]):
+    opzioni = {"env": _ambiente_pulito(), "close_fds": True,
+               "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        opzioni["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000   # DETACHED, NEW_PROCESS_GROUP, NO_WINDOW
+    else:
+        opzioni["start_new_session"] = True
+    subprocess.Popen(comando, **opzioni)
+
+
+def prepara_installazione(scaricato: str) -> List[str]:
+    """Prepara la sostituzione e restituisce il comando da avviare dopo la chiusura del programma.
+    Lo scambio vero avviene solo dopo l'uscita di questo processo (lo script aspetta il PID)."""
+    import shlex
+    modo, percorso = tipo_installazione()
+    pid = os.getpid()
+    if modo == "exe":
+        def q(s):
+            return s.replace("%", "%%")
+        script = os.path.join(tempfile.gettempdir(), f"p7mreader-aggiorna-{pid}.cmd")
+        righe = ["@echo off", "chcp 65001 >nul", "set /a n=0", ":attendi",
+                 f'tasklist /FI "PID eq {pid}" /NH | find "{pid}" >nul',
+                 "if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto attendi)",
+                 ":sposta", f'move /y "{q(scaricato)}" "{q(percorso)}" >nul 2>&1',
+                 "if not errorlevel 1 goto avvia", "set /a n+=1", "if %n% geq 30 goto fallito",
+                 "ping -n 2 127.0.0.1 >nul", "goto sposta",
+                 ":avvia", f'start "" "{q(percorso)}"', "goto fine",
+                 ":fallito", f'explorer /select,"{q(scaricato)}"',
+                 ":fine", '(goto) 2>nul & del "%~f0"']
+        with open(script, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("\n".join(righe) + "\n")
+        return ["cmd.exe", "/d", "/c", script]
+    attendi = f"while kill -0 {pid} 2>/dev/null; do sleep 0.5; done\n"
+    if modo == "appimage":
+        os.chmod(scaricato, 0o755)
+        corpo = f"mv -f {shlex.quote(scaricato)} {shlex.quote(percorso)}\nexec {shlex.quote(percorso)}\n"
+    elif modo == "cartella":
+        nuova = percorso.rstrip("/") + f".nuova-{pid}"
+        shutil.rmtree(nuova, ignore_errors=True)
+        estratta = tempfile.mkdtemp(prefix=".p7mreader-", dir=os.path.dirname(percorso))
+        with tarfile.open(scaricato) as tf:
+            tf.extractall(estratta, filter="data")
+        interna = next((os.path.join(r, "P7MReader") for r, dirs, _f in os.walk(estratta)
+                        if "P7MReader" in dirs and os.path.isfile(os.path.join(r, "P7MReader", "P7MReader"))), None)
+        if interna is None:
+            shutil.rmtree(estratta, ignore_errors=True)
+            raise ValueError(T("il pacchetto scaricato non contiene il programma"))
+        os.replace(interna, nuova)
+        shutil.rmtree(estratta, ignore_errors=True)
+        os.remove(scaricato)
+        vecchia = percorso.rstrip("/") + f".vecchia-{pid}"
+        corpo = (f"mv {shlex.quote(percorso)} {shlex.quote(vecchia)} && mv {shlex.quote(nuova)} {shlex.quote(percorso)} "
+                 f"&& rm -rf {shlex.quote(vecchia)}\nexec {shlex.quote(os.path.join(percorso, 'P7MReader'))}\n")
+    elif modo == "app":
+        punto = tempfile.mkdtemp(prefix="p7mreader-dmg-")
+        subprocess.run(["hdiutil", "attach", scaricato, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", punto],
+                       check=True, capture_output=True, timeout=180)
+        nuova = percorso[:-4] + f".nuova-{pid}.app"
+        try:
+            sorgente = next((os.path.join(punto, n) for n in os.listdir(punto) if n.endswith(".app")), None)
+            if sorgente is None:
+                raise ValueError(T("il pacchetto scaricato non contiene il programma"))
+            shutil.rmtree(nuova, ignore_errors=True)
+            subprocess.run(["ditto", sorgente, nuova], check=True, capture_output=True, timeout=600)
+        finally:
+            subprocess.run(["hdiutil", "detach", punto, "-quiet"], capture_output=True, timeout=120)
+        os.remove(scaricato)
+        vecchia = percorso[:-4] + f".vecchia-{pid}.app"
+        corpo = (f"mv {shlex.quote(percorso)} {shlex.quote(vecchia)} && mv {shlex.quote(nuova)} {shlex.quote(percorso)} "
+                 f"&& rm -rf {shlex.quote(vecchia)}\nopen {shlex.quote(percorso)}\n")
+    else:
+        raise ValueError(T("questa installazione si aggiorna a mano"))
+    script = os.path.join(tempfile.gettempdir(), f"p7mreader-aggiorna-{pid}.sh")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n" + attendi + 'rm -f "$0"\n' + corpo)
+    os.chmod(script, 0o700)
+    return ["/bin/sh", script]
+
+
+# ============================================================ UI: AGGIORNAMENTI
+class LavoroAggiornamento(QThread):
+    """Esegue in sottofondo funzione(lavoro): controllo, download e preparazione dell'aggiornamento."""
+    avanzamento = pyqtSignal(int, int)
+    finito = pyqtSignal(object, str)
+
+    def __init__(self, funzione):
+        super().__init__()
+        self.funzione = funzione
+        self.fermo = threading.Event()
+
+    def run(self):
+        try:
+            self.finito.emit(self.funzione(self), "")
+        except InterruptedError:
+            self.finito.emit(None, "")
+        except Exception as e:
+            log_errore("aggiornamento\n" + traceback.format_exc())
+            self.finito.emit(None, str(e) or type(e).__name__)
+
+
+def _colora_link(documento, colore):
+    """Il Markdown di Qt colora i link con il blu predefinito, illeggibile sul tema scuro: si ricolorano qui."""
+    cursore = QTextCursor(documento)
+    blocco = documento.begin()
+    while blocco.isValid():
+        it = blocco.begin()
+        while not it.atEnd():
+            pezzo = it.fragment()
+            formato = pezzo.charFormat()
+            if formato.isAnchor():
+                formato.setForeground(QColor(colore))
+                cursore.setPosition(pezzo.position())
+                cursore.setPosition(pezzo.position() + pezzo.length(), QTextCursor.MoveMode.KeepAnchor)
+                cursore.setCharFormat(formato)
+            it += 1
+        blocco = blocco.next()
+
+
+class DialogoAggiornamento(QDialog):
+    def __init__(self, parent, info: dict, sostituibile: bool):
+        super().__init__(parent)
+        self.setWindowTitle(T("Aggiornamento disponibile"))
+        self.setMinimumWidth(720)
+        self.scelta = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(10)
+        lay.addWidget(etichetta(T("È disponibile P7MReader {nuova}", nuova=info["versione"]), "titoloMedio"))
+        p = info.get("pacchetto")
+        if p is None:
+            spiega = T("Per questo sistema non c'è un pacchetto pronto: scaricalo dalla pagina della release.")
+            if tipo_installazione()[0] == "sorgente":
+                spiega = T("Stai usando il programma da sorgente: aggiornalo con «git pull» o scaricando il codice dalla release.")
+        elif sostituibile:
+            spiega = T("Il pacchetto ({nome}, {dim}) viene scaricato, confrontato con l'impronta SHA-256 pubblicata nella "
+                       "release e installato al posto di questa versione. Poi P7MReader si riavvia.",
+                       nome=p["nome"], dim=fmt_size(p["dimensione"]))
+        else:
+            spiega = T("Il pacchetto ({nome}, {dim}) viene scaricato nella cartella Download e controllato con l'impronta "
+                       "SHA-256 della release; poi lo installi tu al posto di questa versione.",
+                       nome=p["nome"], dim=fmt_size(p["dimensione"]))
+        lay.addWidget(etichetta(T("Hai la versione {attuale}.", attuale=APP_VERSION) + " " + spiega, "attenuato", True))
+        if info.get("note"):
+            lay.addWidget(etichetta(T("Novità"), "etichetta"))
+            note = QTextBrowser()
+            note.setOpenExternalLinks(True)
+            note.setMarkdown(info["note"])
+            _colora_link(note.document(), C["accento_chiaro"])   # leggibili anche nel tema scuro
+            note.setMinimumHeight(180)
+            accessibile(note, T("Novità della versione {nuova}", nuova=info["versione"]))
+            lay.addWidget(note, 1)
+        riga = QHBoxLayout()
+        if p is not None:
+            b = pulsante(T("Aggiorna e riavvia") if sostituibile else T("Scarica"), "aggiorna", "primario")
+            b.setAutoDefault(True)
+            b.setDefault(True)
+            b.clicked.connect(lambda: self._scegli("installa" if sostituibile else "scarica"))
+            riga.addWidget(b)
+        bp = pulsante(T("Pagina della release"), None, None, T("Apre la pagina della release nel browser"))
+        bp.clicked.connect(lambda: self._scegli("pagina"))
+        riga.addWidget(bp)
+        riga.addStretch()
+        bs = pulsante(T("Salta questa versione"), None, "fantasma", T("Non avvisare più per questa versione"))
+        bs.clicked.connect(lambda: self._scegli("salta"))
+        bd = pulsante(T("Più tardi"), None, "fantasma")
+        bd.clicked.connect(self.reject)
+        riga.addWidget(bs)
+        riga.addWidget(bd)
+        for i in range(riga.count()):                  # i pulsanti non si accorciano mai fino a tagliare il testo
+            w = riga.itemAt(i).widget()
+            if w is not None:
+                w.setMinimumWidth(w.sizeHint().width())
+        lay.addLayout(riga)
+
+    def _scegli(self, s):
+        self.scelta = s
+        self.accept()
+
+
+def cartella_download() -> str:
+    from PyQt6.QtCore import QStandardPaths
+    c = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or os.path.expanduser("~")
+    os.makedirs(c, exist_ok=True)
+    return c
 
 
 # ============================================================ APP PRINCIPALE
@@ -4289,6 +4681,9 @@ class Finestra(QMainWindow):
         QTimer.singleShot(0, lambda: self.tabs.currentWidget().setFocus(Qt.FocusReason.OtherFocusReason))
         self.tabs.currentChanged.connect(self._focus_scheda)
         scarica_tsl_in_sottofondo()
+        self._lavoro_agg = self._lavoro_scarica = None
+        self.impostazioni.b_agg.clicked.connect(lambda: self.controlla_aggiornamenti(True))
+        QTimer.singleShot(4000, self.controlla_aggiornamenti_auto)
         if percorsi_avvio:
             QTimer.singleShot(300, lambda: self.gestisci_percorsi(percorsi_avvio))
 
@@ -4385,6 +4780,122 @@ class Finestra(QMainWindow):
         self.vai(bersaglio)
         bersaglio.carica([f for f in files if supportato(os.path.basename(f), bersaglio._estensioni)], cartelle, ricorsiva)
 
+    # ---------------------------------------------------------------- aggiornamenti
+    def controlla_aggiornamenti_auto(self):
+        if _SELFTEST or not IMP["aggiornamenti_auto"]:
+            return
+        try:
+            ultimo = float(IMP["agg_ultimo_controllo"] or 0)
+        except (TypeError, ValueError):
+            ultimo = 0
+        if 0 <= time.time() - ultimo < INTERVALLO_CONTROLLO:
+            return
+        self.controlla_aggiornamenti(False)
+
+    def controlla_aggiornamenti(self, manuale=True):
+        if self._lavoro_agg is not None and self._lavoro_agg.isRunning():
+            return
+        self.impostazioni.stato_aggiornamenti(T("Controllo in corso…"))
+        self._lavoro_agg = LavoroAggiornamento(lambda _l: controlla_aggiornamenti())
+        self._lavoro_agg.finito.connect(lambda r, err: self._esito_controllo(r, err, manuale))
+        self._lavoro_agg.start()
+
+    def _esito_controllo(self, info, errore, manuale):
+        IMP["agg_ultimo_controllo"] = time.time()
+        IMP.salva()
+        adesso = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+        if errore or info is None:
+            self.impostazioni.stato_aggiornamenti(T("Ultimo controllo non riuscito ({quando}).", quando=adesso))
+            if manuale:
+                avviso(self, "Aggiornamenti", T("Non è stato possibile controllare gli aggiornamenti: {errore}", errore=errore), "warn")
+            return
+        if not info["nuova"]:
+            self.impostazioni.stato_aggiornamenti(T("Hai l'ultima versione ({versione}) · controllato il {quando}.",
+                                                    versione=APP_VERSION, quando=adesso))
+            if manuale:
+                avviso(self, "Aggiornamenti", T("Hai già l'ultima versione di P7MReader ({versione}).", versione=APP_VERSION), "info")
+            return
+        self.impostazioni.stato_aggiornamenti(T("È disponibile la versione {nuova} · controllato il {quando}.",
+                                                nuova=info["versione"], quando=adesso))
+        self.statusBar().showMessage(T("È disponibile P7MReader {nuova}", nuova=info["versione"]), 15000)
+        if not manuale and IMP["agg_ignorata"] == info["versione"]:
+            return
+        sostituibile = info.get("pacchetto") is not None and puo_sostituirsi()
+        d = DialogoAggiornamento(self, info, sostituibile)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        if d.scelta == "salta":
+            IMP["agg_ignorata"] = info["versione"]
+            IMP.salva()
+        elif d.scelta == "pagina":
+            QDesktopServices.openUrl(QUrl(info["pagina"]))
+        elif d.scelta in ("installa", "scarica"):
+            self._scarica_aggiornamento(info, d.scelta == "installa")
+
+    def _scarica_aggiornamento(self, info, installa):
+        if installa and any(p.occupato() for p in (self.verifica, self.estrazione)):
+            avviso(self, "Aggiornamenti", T("Attendi la fine della verifica o dell'estrazione in corso, poi riprova."), "info")
+            return
+        try:
+            destinazione = os.path.dirname(tipo_installazione()[1]) if installa else cartella_download()
+        except Exception as e:
+            avviso(self, "Aggiornamenti", str(e), "error")
+            return
+        prog = QProgressDialog(T("Scaricamento di P7MReader {nuova}…", nuova=info["versione"]), T("Annulla"), 0, 100, self)
+        prog.setWindowTitle(T("Aggiornamento"))
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.setValue(0)
+
+        def lavoro(l):
+            avanza = lambda fatti, totale: l.avanzamento.emit(fatti, totale)
+            percorso = scarica_verificato(info, destinazione, avanza, l.fermo)
+            if not installa:
+                return percorso
+            if l.fermo.is_set():
+                os.remove(percorso)
+                raise InterruptedError()
+            l.avanzamento.emit(-1, 0)
+            return prepara_installazione(percorso)
+
+        def avanzamento(fatti, totale):
+            if fatti < 0:
+                prog.setLabelText(T("Preparazione dell'aggiornamento…"))
+                prog.setRange(0, 0)
+                prog.setCancelButton(None)
+            elif totale > 0:
+                prog.setValue(min(100, int(fatti * 100 / totale)))
+                prog.setLabelText(T("Scaricamento di P7MReader {nuova}…", nuova=info["versione"]) + f"\n{fmt_size(fatti)} / {fmt_size(totale)}")
+
+        def finito(risultato, errore):
+            prog.close()
+            if errore:
+                avviso(self, "Aggiornamenti", T("Aggiornamento non riuscito: {errore}", errore=errore), "error")
+            elif risultato is None:
+                self.statusBar().showMessage(T("Download annullato"), 5000)
+            elif installa:
+                try:
+                    _avvia_staccato(risultato)
+                except Exception as e:
+                    avviso(self, "Aggiornamenti", T("Aggiornamento non riuscito: {errore}", errore=str(e)), "error")
+                    return
+                self.close()
+                QApplication.quit()
+            else:
+                mostra_in_cartella(risultato)
+                if sys.platform == "darwin":
+                    apri_con_sistema(risultato)
+                avviso(self, "Aggiornamenti", T("Pacchetto scaricato e verificato (SHA-256): {percorso}\n\nChiudi P7MReader e "
+                                                "installalo al posto di questa versione.", percorso=risultato), "info")
+
+        self._lavoro_scarica = LavoroAggiornamento(lavoro)
+        self._lavoro_scarica.avanzamento.connect(avanzamento)
+        self._lavoro_scarica.finito.connect(finito)
+        prog.canceled.connect(self._lavoro_scarica.fermo.set)
+        self._lavoro_scarica.start()
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.overlay.setGeometry(self.centralWidget().rect())
@@ -4444,6 +4955,8 @@ def _traduzioni_qt(app):
 
 def selftest() -> int:
     """Per gli automatismi di build: moduli, Trusted List, interfaccia. 0 = tutto bene."""
+    global _SELFTEST
+    _SELFTEST = True
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     esiti = []
     try:
@@ -4456,6 +4969,8 @@ def selftest() -> int:
         esiti.append(("Autenticita' lista", True, ARCHIVIO.tsl_dettaglio.replace("\n", " | ")))
         esiti.append(("Radici", len(ARCHIVIO.radici) > 0, str(len(ARCHIVIO.radici))))
         esiti.append(("Lingua", True, LINGUA))
+        modo, percorso = tipo_installazione()
+        esiti.append(("Aggiornamenti", True, f"{modo} · {suffisso_pacchetto() or '-'} · {percorso}"))
         f = Finestra([])
         f.close()
         esiti.append(("Interfaccia", True, "ok"))

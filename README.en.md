@@ -321,6 +321,25 @@ P7MReader.exe document.pdf.p7m "C:\Signed deeds"
 | `Esc` | Cancel the running operation |
 | `Tab` / `Shift+Tab` | Move between controls (the highlighted border shows where you are) |
 
+## Updates
+
+P7MReader updates itself, with no need to go back to the releases page:
+
+- **at startup** it checks for a new version (at most **once a day**; turn it off in *Settings → Updates*);
+- **whenever you like**: *Settings → Updates → Check now*.
+
+When a new version is out you see what's new and choose *Update and restart*, *Skip this version* or *Later*. With *Update and restart* the program downloads the package for your system, checks its **SHA-256** fingerprint against the `SHA256SUMS.txt` file of the same release (if it does not match the update stops and nothing is touched) and replaces itself on restart:
+
+| How you use it | What happens |
+|---|---|
+| Windows, `.exe` | The new exe replaces the current one (same path: shortcuts and file associations keep working) |
+| Linux, AppImage | The new file replaces the current AppImage |
+| Linux, `.tar.gz` installed with `installa-linux.sh` | The `~/.local/opt/p7mreader` folder is replaced |
+| macOS, app in *Applications* (or another folder of yours) | The new app replaces the current one |
+| Folder without write permission, app opened straight from the `.dmg`, running from source | The verified package is downloaded to *Downloads* and shown: you install it yourself (from source: `git pull`) |
+
+The check only calls GitHub's public API (`api.github.com`); downloads come from `github.com`. No documents or personal data are sent.
+
 ## The verification engine
 
 For every signature (and countersignature) these checks are performed and shown:
@@ -397,6 +416,7 @@ Italian qualified trust service providers (QTSPs) each give away their own progr
 | Reason for the outcome of every check, eIDAS qualification (QES, seal, QSCD), provider status at signing time | Yes, always shown | Level of detail varies by program |
 | Trusted List accepted only if its signature is intact and the signer is the one published by the European Commission (LOTL) | Yes | Not publicly documented |
 | Italian e-invoice summary and CSV/HTML report | Yes | Varies |
+| Built-in updater, with SHA-256 check of the package | Yes | Depends on the program |
 | Account, registration, usage limits | None | Depends: e.g. GoSign without signing in has a monthly limit<sup>[2]</sup> |
 | Documents sent to a server | Never | Yes for online verification services; for desktop programs it depends on the features used |
 | Source code | Open (GPL v3) | Closed (the Commission's DSS is open source) |
@@ -464,7 +484,7 @@ On every build the bundled copy of the AgID Trusted List is replaced with the of
 
 On macOS and Linux the folder is `~/.config/P7MReader`.
 
-**Network connections**: only to the AgID Trusted List, the European Commission LOTL and the OCSP/CRL/AIA servers named in the certificates. Documents are never sent anywhere.
+**Network connections**: only to the AgID Trusted List, the European Commission LOTL, the OCSP/CRL/AIA servers named in the certificates and, for [updates](#updates), GitHub. Documents are never sent anywhere.
 
 ## License
 

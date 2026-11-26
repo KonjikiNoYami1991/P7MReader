@@ -90,6 +90,13 @@ jobs:
           chmod +x dist/*.AppImage
           QT_QPA_PLATFORM=offscreen APPIMAGE_EXTRACT_AND_RUN=1 timeout 120 dist/*.AppImage --selftest
 
+      - name: Prova dell'aggiornatore integrato (server locale, programma finto)
+        timeout-minutes: 10
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python packaging/prova_aggiornamento.py
+
       - uses: actions/upload-artifact@v7
         with:
           name: P7MReader-${{ matrix.nome }}

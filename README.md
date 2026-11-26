@@ -321,6 +321,25 @@ P7MReader.exe documento.pdf.p7m "C:\Atti firmati"
 | `Esc` | Annulla l'operazione in corso |
 | `Tab` / `Maiusc+Tab` | Spostarsi tra i controlli (il bordo evidenziato mostra dove si è) |
 
+## Aggiornamenti
+
+P7MReader si aggiorna da solo, senza dover tornare sulla pagina delle release:
+
+- **all'avvio** controlla se c'è una versione nuova (al massimo **una volta al giorno**; si spegne in *Impostazioni → Aggiornamenti*);
+- **quando vuoi**: *Impostazioni → Aggiornamenti → Controlla ora*.
+
+Se c'è una versione nuova vedi le novità e scegli *Aggiorna e riavvia*, *Salta questa versione* o *Più tardi*. Con *Aggiorna e riavvia* il programma scarica il pacchetto del tuo sistema, ne confronta l'impronta **SHA-256** con il file `SHA256SUMS.txt` della stessa release (se non coincide l'aggiornamento si ferma e non tocca nulla) e si sostituisce al riavvio:
+
+| Come lo usi | Cosa succede |
+|---|---|
+| Windows, `.exe` | Il nuovo exe prende il posto di quello attuale (stesso percorso: collegamenti e associazioni restano validi) |
+| Linux, AppImage | Il nuovo file prende il posto dell'AppImage attuale |
+| Linux, `.tar.gz` installato con `installa-linux.sh` | Viene sostituita la cartella `~/.local/opt/p7mreader` |
+| macOS, app in *Applicazioni* (o in un'altra cartella tua) | La nuova app prende il posto di quella attuale |
+| Cartella senza permesso di scrittura, app aperta direttamente dal `.dmg`, avvio da sorgente | Il pacchetto verificato viene scaricato in *Download* e mostrato: lo installi tu (da sorgente: `git pull`) |
+
+Per il controllo viene interpellata solo l'API pubblica di GitHub (`api.github.com`); i download arrivano da `github.com`. Non viene inviato nessun documento né dato personale.
+
 ## Il motore di verifica
 
 Per ogni firma (e controfirma) vengono eseguiti e mostrati questi controlli:
@@ -397,6 +416,7 @@ I certificatori (QTSP) italiani distribuiscono gratuitamente un proprio programm
 | Motivo dell'esito per ogni controllo, qualificazione eIDAS (QES, sigillo, QSCD), stato del certificatore alla data della firma | Sì, sempre visibili | Il dettaglio varia da programma a programma |
 | Trusted List accettata solo se la sua firma è integra e il firmatario è quello pubblicato dalla Commissione europea (LOTL) | Sì | Non documentato pubblicamente |
 | Riepilogo della fattura elettronica e report CSV/HTML | Sì | Variabile |
+| Aggiornamento integrato, con verifica SHA-256 del pacchetto | Sì | Dipende dal programma |
 | Account, registrazione, limiti d'uso | Nessuno | Dipende: ad esempio GoSign senza accesso ha un limite mensile<sup>[2]</sup> |
 | Documenti inviati a un server | Mai | Sì per i servizi di verifica online; per i programmi desktop dipende dalle funzioni usate |
 | Codice sorgente | Aperto (GPL v3) | Chiuso (DSS della Commissione è open source) |
@@ -462,7 +482,7 @@ A ogni compilazione la copia inclusa della Trusted List AgID viene sostituita co
 
 Su macOS e Linux la cartella è `~/.config/P7MReader`.
 
-**Connessioni di rete**: solo verso la Trusted List AgID, la LOTL della Commissione europea e i server OCSP/CRL/AIA indicati nei certificati. I documenti non vengono mai inviati da nessuna parte.
+**Connessioni di rete**: solo verso la Trusted List AgID, la LOTL della Commissione europea, i server OCSP/CRL/AIA indicati nei certificati e, per gli [aggiornamenti](#aggiornamenti), GitHub. I documenti non vengono mai inviati da nessuna parte.
 
 ## Licenza
 
