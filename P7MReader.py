@@ -1,5 +1,5 @@
 """
-P7MReader 3.2.0 - Verifica firme digitali ed estrazione documenti
+P7MReader 3.2.1 - Verifica firme digitali ed estrazione documenti
 Supporto: CAdES (.p7m, .p7s, anche annidati / base64), PAdES (.pdf), XAdES (.xml, fatture elettroniche)
 
 Uso:    python P7MReader.py [file o cartelle...]      python P7MReader.py --selftest
@@ -7,6 +7,13 @@ Build:  build_p7mreader.bat  (PyInstaller, P7MReader.spec)
 Dipendenze: PyQt6, pyhanko, pyhanko-certvalidator, asn1crypto, cryptography, lxml
 
 Changelog
+3.2.1 (2026-11-26)
+- Le note di ogni release sono la sezione della versione in questo changelog, seguita dall'elenco automatico
+  di GitHub; il workflow "Note delle release" riscrive il testo di una release gia' pubblicata
+- Build: rilanciare la release su un tag che esiste gia' ricompila il commit del tag (non l'ultimo di main)
+  e sostituisce pacchetti, impronte e note invece di fallire
+- Nessuna modifica al funzionamento del programma rispetto alla 3.2.0
+
 3.2.0 (2026-11-26)
 - Aggiunto: aggiornatore integrato. All'avvio (al massimo una volta al giorno, disattivabile) e con
   Impostazioni -> Aggiornamenti -> Controlla ora cerca l'ultima release su GitHub, mostra le novita',
@@ -131,7 +138,7 @@ for _nome_log in ("pyhanko", "pyhanko_certvalidator"):      # gli esiti li gesti
     logging.getLogger(_nome_log).setLevel(logging.CRITICAL)
 
 APP_NAME = "P7MReader"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 ESTENSIONI_VERIFICA = ('.p7m', '.p7s', '.pdf', '.xml')
 ESTENSIONI_ESTRAI = ('.p7m',)
 MAX_ANNIDAMENTO = 6

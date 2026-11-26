@@ -3,7 +3,8 @@ name: Build
 # Compila P7MReader per Windows, macOS (Apple Silicon e Intel) e Linux.
 # - Avvio manuale: scheda Actions -> Build -> Run workflow (i pacchetti si scaricano dagli "Artifacts" della run)
 # - Tag "v*" (es. v3.1.0): oltre agli artifacts crea una Release con tutti i pacchetti allegati
-# - Avvio manuale con "release" compilato (es. v3.1.0): GitHub crea il tag sul commit compilato e la Release
+# - Avvio manuale con "release" compilato (es. v3.1.0): GitHub crea il tag sul commit compilato e la Release.
+#   Se il tag esiste gia' (rilancio) si ricompila il commit del tag e si sostituiscono pacchetti e note della Release
 # - Chiamato da prove-sistemi.yml: compila e basta; i pacchetti vengono poi provati sulle varie distribuzioni
 # Le note della Release sono la sezione della versione nel changelog in testa a P7MReader.py (packaging/note_release.py):
 # senza quella sezione la Release non viene creata.
@@ -28,7 +29,30 @@ permissions:
   contents: write
 
 jobs:
+  # Che cosa si compila: per una Release su un tag che esiste gia' (rilancio) il commit del tag, non l'ultimo di main;
+  # altrimenti il commit che ha avviato il workflow.
+  prepara:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+      tag: ${{ steps.ref.outputs.tag }}
+    steps:
+      - id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}
+        run: |
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ] && sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha 2>/dev/null)"; then
+            echo "Il tag $TAG esiste gia' (commit $sha): si ricompila quel commit"
+            echo "ref=$sha" >> "$GITHUB_OUTPUT"
+          else
+            echo "Si compila il commit $GITHUB_SHA"
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: prepara
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +69,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepara.outputs.ref }}
 
       - uses: actions/setup-python@v7
         with:
@@ -110,27 +136,39 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
-    needs: build
+    if: needs.prepara.outputs.tag != ''
+    needs: [prepara, build]
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepara.outputs.tag }}
+      COMMIT: ${{ needs.prepara.outputs.ref }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepara.outputs.ref }}
 
       - name: Note della release dal changelog di P7MReader.py
-        run: python3 packaging/note_release.py "${{ inputs.release || github.ref_name }}" > "$RUNNER_TEMP/note.md" && cat "$RUNNER_TEMP/note.md"
+        run: python3 packaging/note_release.py "$TAG" > "$RUNNER_TEMP/note.md" && cat "$RUNNER_TEMP/note.md"
 
       - uses: actions/download-artifact@v8
         with:
           path: pacchetti
           merge-multiple: true
+
       - name: Impronte SHA-256
         run: cd pacchetti && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.release || github.ref_name }}
-          target_commitish: ${{ github.sha }}
-          name: P7MReader ${{ inputs.release || github.ref_name }}
-          files: pacchetti/*
-          body_path: ${{ runner.temp }}/note.md
-          # le note del changelog vanno in testa, poi l'elenco automatico di GitHub (commit e "Full Changelog")
-          generate_release_notes: true
+
+      # Con gh e non con softprops/action-gh-release: aggiornando una Release esistente quell'azione rimanda anche il
+      # commit, e GitHub rifiuta la modifica al GITHUB_TOKEN se il commit cambia file in .github/workflows.
+      - name: Pubblica la Release (nuova) o sostituisci pacchetti e note (gia' esistente)
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "La Release $TAG esiste: si sostituiscono pacchetti e note"
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$TAG" --jq .body >> "$RUNNER_TEMP/note.md" || true
+            gh release upload "$TAG" pacchetti/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/note.md"
+          else
+            gh release create "$TAG" pacchetti/* --repo "$GITHUB_REPOSITORY" --target "$COMMIT" \
+              --title "P7MReader $TAG" --notes-file "$RUNNER_TEMP/note.md" --generate-notes
+          fi

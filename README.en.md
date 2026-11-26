@@ -473,7 +473,7 @@ macOS and Linux (`.app` + `.dmg`, or AppImage + `.tar.gz`):
 
 Releases are built automatically on GitHub Actions when a `v*` tag (e.g. `v3.1.0`) is pushed, for Windows, macOS and Linux.
 On every build the bundled copy of the AgID Trusted List is replaced with the official one if it is newer (`packaging/aggiorna_tsl.py`); without a network the existing copy is kept.
-The release text is the version's section of the changelog at the top of `P7MReader.py` (`packaging/note_release.py`); to rewrite the notes of a release already published there is the *Note delle release* workflow.
+The release text is the version's section of the changelog at the top of `P7MReader.py` (`packaging/note_release.py`); to rewrite the notes of a release already published there is the *Note delle release* workflow. Running *Build* again with the tag of an existing release rebuilds that tag's commit and replaces its packages, fingerprints and notes.
 
 ## Where data is stored
 
