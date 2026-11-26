@@ -1,8 +1,10 @@
 name: Note delle release
 
 # Riscrive SOLO il testo di una Release gia' pubblicata con la sezione del changelog di P7MReader.py
-# (packaging/note_release.py). Non ricompila e non tocca i pacchetti allegati.
+# (packaging/note_release.py), seguita dalle note automatiche di GitHub. Non ricompila e non tocca i pacchetti.
 # Avvio: scheda Actions -> Note delle release -> Run workflow, indicando il tag (es. v3.2.0).
+# Si usa "gh release edit" e non softprops/action-gh-release: quest'ultima rimanda anche il commit della Release,
+# e GitHub rifiuta la modifica al GITHUB_TOKEN quando quel commit cambia file in .github/workflows.
 on:
   workflow_dispatch:
     inputs:
@@ -16,14 +18,17 @@ permissions:
 jobs:
   note:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Note dal changelog
-        run: python3 packaging/note_release.py "${{ inputs.tag }}" > "$RUNNER_TEMP/note.md" && cat "$RUNNER_TEMP/note.md"
+      - name: Note dal changelog + note automatiche di GitHub
+        run: |
+          python3 packaging/note_release.py "$TAG" > "$RUNNER_TEMP/note.md"
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$TAG" --jq .body >> "$RUNNER_TEMP/note.md" || true
+          cat "$RUNNER_TEMP/note.md"
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.tag }}
-          body_path: ${{ runner.temp }}/note.md
-          generate_release_notes: true
+      - name: Aggiorna il testo della Release
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/note.md"
