@@ -369,9 +369,57 @@ Designed following **WCAG 2.1 level AA**, without changing the look:
 - **animations** can be turned off and stay off when animation effects are disabled in Windows;
 - the HTML report uses table headers, document language and text alternatives for symbols.
 
+## Compared with the Italian trust service providers' software
+
+Italian qualified trust service providers (QTSPs) each give away their own program to sign and verify, and AgID keeps a [list of them](https://www.agid.gov.it/it/piattaforme/firma-elettronica-qualificata/software-verifica)<sup>[1]</sup>. P7MReader does not replace them: **it does not sign**, it only verifies and extracts. Here is what it shares with them and what is different.
+
+| Program | By | What it does | Systems | Notes |
+|---|---|---|---|---|
+| **GoSign Desktop** (formerly Dike) | InfoCert | CAdES and PAdES signing, verification of signed files in any format; XAdES signing only in the PRO version | Windows, macOS, Linux | Without signing in with an InfoCert account the manual states at most 5 verifications a month<sup>[2]</sup> |
+| **ArubaSign** | Aruba | *Sign* and *Verify* tabs, opens `.p7m` files | Windows, macOS (some guides also mention Linux) | Free<sup>[3][4]</sup> |
+| **Namirial Sign** (formerly FirmaCerta) | Namirial | Signing and verification, also in the browser; free online verification service | Windows 10/11, macOS 13-26, Linux (Ubuntu LTS) | <sup>[5][6]</sup> |
+| **firmaOK!** | Poste Italiane | Signing, signature and timestamp verification, smart card and token PIN/PUK management | Windows, macOS, Ubuntu | Can be used for verification only<sup>[7]</sup> |
+| **Firma4NG** | Bit4id, distributed by the Chambers of Commerce | Signing, verification of PDF and XML signatures and timestamps, encryption | Windows, macOS, Linux | <sup>[8][9]</sup> |
+| **DSS demonstration** | European Commission | Online validation of eIDAS signatures (open source DSS library) | Browser | For testing only: files are sent to the Commission's servers<sup>[10]</sup> |
+
+**What it has in common with them**
+
+- Verification of **CAdES** (`.p7m`), **PAdES** (PDF) and, in most cases, **XAdES** signatures, with a chain of trust to the **AgID Trusted List** and revocation checks (OCSP/CRL).
+- Opening the document inside the `.p7m` envelope, with details of the signer and the certificate.
+- Free of charge, installed on your computer.
+
+**What is different with P7MReader**
+
+| | P7MReader | Providers' programs |
+|---|---|---|
+| Signing, timestamping, smart card and remote signing | **No** | Yes: it is their main purpose |
+| Thousands of files and whole folders, clean names on extraction | Yes | Varies by program |
+| Reason for the outcome of every check, eIDAS qualification (QES, seal, QSCD), provider status at signing time | Yes, always shown | Level of detail varies by program |
+| Trusted List accepted only if its signature is intact and the signer is the one published by the European Commission (LOTL) | Yes | Not publicly documented |
+| Italian e-invoice summary and CSV/HTML report | Yes | Varies |
+| Account, registration, usage limits | None | Depends: e.g. GoSign without signing in has a monthly limit<sup>[2]</sup> |
+| Documents sent to a server | Never | Yes for online verification services; for desktop programs it depends on the features used |
+| Source code | Open (GPL v3) | Closed (the Commission's DSS is open source) |
+| Support from a company | No (independent project; executables not signed by a registered developer) | Yes, from the provider |
+
+> Information about third-party programs comes from the pages and manuals listed below, consulted in **November 2026**: features, limits and supported systems may change, so the vendor's website is authoritative. P7MReader is not affiliated with any of these providers.
+
+**Sources**
+
+1. AgID, [Verification software](https://www.agid.gov.it/it/piattaforme/firma-elettronica-qualificata/software-verifica) (Italian)
+2. InfoCert, [GoSign Desktop user manual](https://knowledgecenter.infocert.digital/documents/Manuale_Utente_GoSign_(DESKTOP)_PDF.pdf) and [GoSign Desktop PRO guide](https://help.infocert.digital/Home/Guida/guide-to-activate-advanced-features-in-gosign-desktop-pro)
+3. University of Genoa, [Aruba tools handbook (December 2025)](https://ict.unige.it/sites/ict.unige.it/files/2025-12/Vademecum%20Strumenti%20ARUBA-v.4_REV_0.pdf) (Italian)
+4. Fastweb, [Programs to open p7m files](https://www.fastweb.it/fastweb-plus/digital-magazine/programmi-per-file-p7m/) (Italian)
+5. Namirial, [Namirial Sign Desktop: characteristics](https://docs.namirial.app/products/namirialsign/desktop/userguide/characteristics)
+6. Namirial, [Digital signature verification](https://focus.namirial.com/it/verifica-firma-digitale/) (Italian)
+7. Poste Italiane, [firmaOK! manual](https://postecert.poste.it/firma/download/firmaOK!_manuale.pdf) and [Remote digital signature](https://www.poste.it/firma-digitale-remota) (Italian)
+8. Bit4id, [Firma4NG datasheet](https://support.bit4id.com/files/downloads/documents/datasheet/ds_firma4_it.pdf) (Italian)
+9. Chamber of Commerce of Cosenza, [Firma4NG 3.3 manual](https://www.cs.camcom.gov.it/sites/default/files/Manuale_firma4ng_3.3.pdf) (Italian)
+10. European Commission, [Digital Signature Service (DSS)](https://ec.europa.eu/digital-building-blocks/sites/spaces/DIGITAL/pages/467109107/Digital+Signature+Service+-+DSS) and [demo documentation](https://ec.europa.eu/digital-building-blocks/DSS/webapp-demo/doc/dss-documentation.html)
+
 ## Running from source
 
-Requires **Python 3.12+** (tested with 3.13 and 3.15). On Linux follow [running from source on Linux](#running-from-source-on-linux), with the system packages for each distribution.
+Requires **Python 3.12+** (tested with 3.13, 3.14 and 3.15). On Linux follow [running from source on Linux](#running-from-source-on-linux), with the system packages for each distribution.
 
 ```bash
 pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi tzdata
@@ -404,6 +452,7 @@ macOS and Linux (`.app` + `.dmg`, or AppImage + `.tar.gz`):
 ```
 
 Releases are built automatically on GitHub Actions when a `v*` tag (e.g. `v3.1.0`) is pushed, for Windows, macOS and Linux.
+On every build the bundled copy of the AgID Trusted List is replaced with the official one if it is newer (`packaging/aggiorna_tsl.py`); without a network the existing copy is kept.
 
 ## Where data is stored
 

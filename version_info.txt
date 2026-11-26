@@ -4,8 +4,8 @@
 # build_p7mreader.bat le riallinea da sole ad APP_VERSION di P7MReader.py.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(3, 1, 1, 0),
-    prodvers=(3, 1, 1, 0),
+    filevers=(3, 1, 2, 0),
+    prodvers=(3, 1, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -21,12 +21,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', ''),
             StringStruct('FileDescription', 'P7MReader - digital signature verification and extraction'),
-            StringStruct('FileVersion', '3.1.1.0'),
+            StringStruct('FileVersion', '3.1.2.0'),
             StringStruct('InternalName', 'P7MReader'),
             StringStruct('LegalCopyright', 'GNU GPL v3.0'),
             StringStruct('OriginalFilename', 'P7MReader.exe'),
             StringStruct('ProductName', 'P7MReader'),
-            StringStruct('ProductVersion', '3.1.1.0')
+            StringStruct('ProductVersion', '3.1.2.0')
           ]
         )
       ]

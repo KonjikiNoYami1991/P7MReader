@@ -25,6 +25,7 @@ if [ "${NO_VENV:-0}" != "1" ]; then
 fi
 "$PYTHON" -m pip install --upgrade pip
 "$PYTHON" -m pip install --upgrade pyinstaller PyQt6 asn1crypto pyhanko pyhanko-certvalidator cryptography lxml certifi tzdata pillow
+"$PYTHON" packaging/aggiorna_tsl.py
 VERSIONE="$("$PYTHON" packaging/versione.py)"
 
 echo "[2/4] Icone..."

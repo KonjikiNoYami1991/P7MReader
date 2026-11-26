@@ -15,6 +15,7 @@ echo.
 echo [1/4] Installo/aggiorno le dipendenze...
 python -m pip install --upgrade pyinstaller PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi tzdata
 if errorlevel 1 goto errore
+python packaging\aggiorna_tsl.py
 
 echo.
 echo [2/4] Versione e informazioni dell'exe...

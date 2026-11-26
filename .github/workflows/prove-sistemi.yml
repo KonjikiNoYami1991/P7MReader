@@ -72,9 +72,9 @@ jobs:
           elif command -v zypper >/dev/null; then zypper -n -q install git tar gzip
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: P7MReader-linux-x86_64
           path: pacchetti
@@ -101,15 +101,16 @@ jobs:
           - os: ubuntu-26.04
             pacchetto: linux-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: P7MReader-${{ matrix.pacchetto }}
           path: pacchetti
 
       - name: Selftest (Windows)
         if: runner.os == 'Windows'
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $exe = Get-ChildItem pacchetti/*.exe | Select-Object -First 1
@@ -119,6 +120,8 @@ jobs:
 
       - name: Selftest (macOS)
         if: runner.os == 'macOS'
+        # il 23/11/2026 il selftest su macos-26-intel e' rimasto fermo 35 minuti: meglio fallire subito
+        timeout-minutes: 10
         run: |
           sw_vers
           dmg="$(ls pacchetti/*.dmg | head -1)"

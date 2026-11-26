@@ -369,9 +369,57 @@ Interfaccia pensata secondo le **WCAG 2.1 livello AA**, senza cambiare l'aspetto
 - le **animazioni** si possono spegnere e restano spente se in Windows sono disattivati gli effetti di animazione;
 - il report HTML usa intestazioni di tabella, lingua del documento e testo alternativo per i simboli.
 
+## Confronto con i programmi dei certificatori italiani
+
+I certificatori (QTSP) italiani distribuiscono gratuitamente un proprio programma per firmare e verificare, e AgID ne tiene un [elenco](https://www.agid.gov.it/it/piattaforme/firma-elettronica-qualificata/software-verifica)<sup>[1]</sup>. P7MReader non li sostituisce: **non firma**, si occupa solo di verificare ed estrarre. Ecco cosa ha in comune con loro e cosa cambia.
+
+| Programma | Di chi | Cosa fa | Sistemi | Note |
+|---|---|---|---|---|
+| **GoSign Desktop** (ex Dike) | InfoCert | Firma CAdES e PAdES, verifica di file firmati in qualsiasi formato; firma XAdES solo nella versione PRO | Windows, macOS, Linux | Senza accesso con un account InfoCert il manuale indica al massimo 5 verifiche al mese<sup>[2]</sup> |
+| **ArubaSign** | Aruba | Schede *Firma* e *Verifica*, apertura dei `.p7m` | Windows, macOS (alcune guide citano anche Linux) | Gratuito<sup>[3][4]</sup> |
+| **Namirial Sign** (ex FirmaCerta) | Namirial | Firma e verifica, anche da browser; servizio di verifica online gratuito | Windows 10/11, macOS 13-26, Linux (Ubuntu LTS) | <sup>[5][6]</sup> |
+| **firmaOK!** | Poste Italiane | Firma, verifica di firme e marche temporali, gestione PIN/PUK di smart card e token | Windows, macOS, Ubuntu | Usabile anche solo per verificare<sup>[7]</sup> |
+| **Firma4NG** | Bit4id, distribuito dalle Camere di Commercio | Firma, verifica di firme PDF e XML e di marche temporali, cifratura | Windows, macOS, Linux | <sup>[8][9]</sup> |
+| **DSS demonstration** | Commissione europea | Validazione online di firme eIDAS (libreria open source DSS) | Browser | Solo per prove: i file vengono inviati ai server della Commissione<sup>[10]</sup> |
+
+**In comune con questi programmi**
+
+- Verifica di firme **CAdES** (`.p7m`), **PAdES** (PDF) e, nella maggior parte dei casi, **XAdES**, con catena di fiducia fino alla **Trusted List AgID** e controllo della revoca (OCSP/CRL).
+- Apertura del documento contenuto nella busta `.p7m` e dettaglio di firmatario e certificato.
+- Uso gratuito, programma installato sul computer.
+
+**Cosa cambia con P7MReader**
+
+| | P7MReader | Programmi dei certificatori |
+|---|---|---|
+| Firmare, marcare, gestire smart card e firma remota | **No** | Sì: è il loro scopo principale |
+| Lavoro su migliaia di file e cartelle intere, con nomi puliti all'estrazione | Sì | Varia da programma a programma |
+| Motivo dell'esito per ogni controllo, qualificazione eIDAS (QES, sigillo, QSCD), stato del certificatore alla data della firma | Sì, sempre visibili | Il dettaglio varia da programma a programma |
+| Trusted List accettata solo se la sua firma è integra e il firmatario è quello pubblicato dalla Commissione europea (LOTL) | Sì | Non documentato pubblicamente |
+| Riepilogo della fattura elettronica e report CSV/HTML | Sì | Variabile |
+| Account, registrazione, limiti d'uso | Nessuno | Dipende: ad esempio GoSign senza accesso ha un limite mensile<sup>[2]</sup> |
+| Documenti inviati a un server | Mai | Sì per i servizi di verifica online; per i programmi desktop dipende dalle funzioni usate |
+| Codice sorgente | Aperto (GPL v3) | Chiuso (DSS della Commissione è open source) |
+| Assistenza di un'azienda | No (progetto indipendente; eseguibili non firmati da uno sviluppatore registrato) | Sì, dal certificatore |
+
+> Le informazioni sui programmi di terzi vengono dalle pagine e dai manuali indicati qui sotto, consultati a **novembre 2026**: funzioni, limiti e sistemi supportati possono cambiare, quindi fa fede il sito del produttore. P7MReader non è affiliato a nessuno di questi certificatori.
+
+**Fonti**
+
+1. AgID, [Software di verifica](https://www.agid.gov.it/it/piattaforme/firma-elettronica-qualificata/software-verifica)
+2. InfoCert, [Manuale utente GoSign Desktop](https://knowledgecenter.infocert.digital/documents/Manuale_Utente_GoSign_(DESKTOP)_PDF.pdf) e [guida GoSign Desktop PRO](https://help.infocert.digital/Home/Guida/guide-to-activate-advanced-features-in-gosign-desktop-pro)
+3. Università di Genova, [Vademecum strumenti Aruba (dicembre 2025)](https://ict.unige.it/sites/ict.unige.it/files/2025-12/Vademecum%20Strumenti%20ARUBA-v.4_REV_0.pdf)
+4. Fastweb, [Programmi per aprire i file p7m](https://www.fastweb.it/fastweb-plus/digital-magazine/programmi-per-file-p7m/)
+5. Namirial, [Namirial Sign Desktop: caratteristiche](https://docs.namirial.app/products/namirialsign/desktop/userguide/characteristics)
+6. Namirial, [Verifica firma digitale](https://focus.namirial.com/it/verifica-firma-digitale/)
+7. Poste Italiane, [Manuale firmaOK!](https://postecert.poste.it/firma/download/firmaOK!_manuale.pdf) e [Firma Digitale Remota](https://www.poste.it/firma-digitale-remota)
+8. Bit4id, [Scheda Firma4NG](https://support.bit4id.com/files/downloads/documents/datasheet/ds_firma4_it.pdf)
+9. Camera di Commercio di Cosenza, [Manuale Firma4NG 3.3](https://www.cs.camcom.gov.it/sites/default/files/Manuale_firma4ng_3.3.pdf)
+10. Commissione europea, [Digital Signature Service (DSS)](https://ec.europa.eu/digital-building-blocks/sites/spaces/DIGITAL/pages/467109107/Digital+Signature+Service+-+DSS) e [documentazione della demo](https://ec.europa.eu/digital-building-blocks/DSS/webapp-demo/doc/dss-documentation.html)
+
 ## Avvio da sorgente
 
-Richiede **Python 3.12+** (testato con 3.13 e 3.15). Su Linux segui la guida [avvio da sorgente su Linux](#avvio-da-sorgente-su-linux), con i pacchetti di sistema per ogni distribuzione.
+Richiede **Python 3.12+** (testato con 3.13, 3.14 e 3.15). Su Linux segui la guida [avvio da sorgente su Linux](#avvio-da-sorgente-su-linux), con i pacchetti di sistema per ogni distribuzione.
 
 ```bash
 pip install PyQt6 pyhanko pyhanko-certvalidator asn1crypto cryptography lxml certifi tzdata
@@ -402,6 +450,7 @@ macOS e Linux (`.app` + `.dmg`, oppure AppImage + `.tar.gz`):
 ```
 
 Le release si costruiscono da sole su GitHub Actions al push di un tag `v*` (es. `v3.1.0`) per Windows, macOS e Linux.
+A ogni compilazione la copia inclusa della Trusted List AgID viene sostituita con quella ufficiale, se più recente (`packaging/aggiorna_tsl.py`); senza rete resta quella presente.
 
 ## Dove salva i dati
 

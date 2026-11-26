@@ -1,5 +1,5 @@
 """
-P7MReader 3.1.1 - Verifica firme digitali ed estrazione documenti
+P7MReader 3.1.2 - Verifica firme digitali ed estrazione documenti
 Supporto: CAdES (.p7m, .p7s, anche annidati / base64), PAdES (.pdf), XAdES (.xml, fatture elettroniche)
 
 Uso:    python P7MReader.py [file o cartelle...]      python P7MReader.py --selftest
@@ -7,6 +7,13 @@ Build:  build_p7mreader.bat  (PyInstaller, P7MReader.spec)
 Dipendenze: PyQt6, pyhanko, pyhanko-certvalidator, asn1crypto, cryptography, lxml
 
 Changelog
+3.1.2 (2026-11-26)
+- Pacchetti compilati con Python 3.14 e le librerie piu' recenti (PyQt6 6.12, pyhanko 0.38, cryptography 50, lxml 6.1)
+- La copia della Trusted List AgID inclusa si aggiorna da sola a ogni compilazione (se ne esiste una piu' recente)
+- Build: GitHub Actions aggiornate (checkout/setup-python/upload-artifact v7, download-artifact v8,
+  action-gh-release v3) e tempo massimo per le prove di avvio, che non restano piu' appese
+- README: confronto con i programmi di firma e verifica dei certificatori italiani, con le fonti
+
 3.1.1 (2026-11-17)
 - Corretto: su Linux e macOS il programma compilato si chiudeva all'avvio se il sistema non aveva il database
   dei fusi orari (/usr/share/zoneinfo): pyhanko lo legge appena caricato. Ora tzdata e' incluso nel pacchetto
@@ -114,7 +121,7 @@ for _nome_log in ("pyhanko", "pyhanko_certvalidator"):      # gli esiti li gesti
     logging.getLogger(_nome_log).setLevel(logging.CRITICAL)
 
 APP_NAME = "P7MReader"
-APP_VERSION = "3.1.1"
+APP_VERSION = "3.1.2"
 ESTENSIONI_VERIFICA = ('.p7m', '.p7s', '.pdf', '.xml')
 ESTENSIONI_ESTRAI = ('.p7m',)
 MAX_ANNIDAMENTO = 6
