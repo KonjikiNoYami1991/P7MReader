@@ -5,9 +5,16 @@ Prende la sezione della versione (es. "3.2.0 (2026-11-26)") fino alla successiva
 le righe che iniziano con "- " diventano voci di elenco, quelle rientrate continuano la voce precedente.
 Gli accenti scritti con l'apostrofo nel sorgente (e', piu', perche') tornano accenti veri (è, più, perché).
 Esce con 1 se il changelog non ha una sezione per quella versione: una release senza note non deve uscire.
+
+In piu':
+- le versioni dello stesso ramo senza una release propria (es. la 3.1, uscita direttamente come 3.1.1) finiscono
+  nelle note della prima release che le contiene, cosi' le loro novita' non restano fuori da GitHub;
+- la tabella dei pacchetti (un file per sistema) con le istruzioni per il primo avvio su macOS;
+- nelle release precedenti all'ultima, il rimando alla versione piu' recente.
 """
 import os
 import re
+import subprocess
 import sys
 
 RADICE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +56,42 @@ def sezione(sorgente: str, versione: str):
     return (data, corpo) if dentro or corpo else None
 
 
+def versioni_changelog(sorgente: str):
+    """[(versione, data)] dei titoli del changelog, dalla piu' recente."""
+    doc = re.match(r'\s*"""(.*?)"""', sorgente, re.S)
+    if not doc or "Changelog" not in doc.group(1):
+        return []
+    out = []
+    for r in doc.group(1).split("Changelog", 1)[1].splitlines():
+        m = _TITOLO.match(r.strip()) if r and not r.startswith((" ", "-")) else None
+        if m:
+            out.append((m.group(1), m.group(2) or ""))
+    return out
+
+
+def versioni_pubblicate():
+    """Versioni con un tag v* su GitHub (None se non si riesce a saperlo: allora non si aggiunge nulla)."""
+    try:
+        r = subprocess.run(["git", "ls-remote", "--tags", "origin"], cwd=RADICE, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        return {tuple(_numeri(m)) for m in re.findall(r"refs/tags/v([\d.]+)$", r.stdout, re.M)}
+    except Exception:
+        return None
+
+
+def pacchetti(versione: str) -> str:
+    righe = [("Windows 10/11 (x64)", f"P7MReader-{versione}-windows-x64.exe"),
+             ("macOS 12+ Apple Silicon", f"P7MReader-{versione}-macOS-arm64.dmg"),
+             ("macOS 12+ Intel", f"P7MReader-{versione}-macOS-x86_64.dmg"),
+             ("Linux x86_64 (Debian 12+, Ubuntu 22.04+, Fedora, Arch, openSUSE, RHEL 9+…)",
+              f"P7MReader-{versione}-x86_64.AppImage` oppure `P7MReader-{versione}-linux-x86_64.tar.gz")]
+    return "\n".join(["## Pacchetti", "", "| Sistema | File |", "|---|---|"] + [f"| {s} | `{f}` |" for s, f in righe] + [
+        "", "Su macOS l'app non è firmata da Apple: al primo avvio, su macOS 15 e successivi *Impostazioni di Sistema → "
+            "Privacy e sicurezza → Apri comunque*, su macOS 12-14 *clic destro sull'app → Apri* "
+            "([istruzioni](https://github.com/KonjikiNoYami1991/P7MReader#primo-avvio-su-macos))."])
+
+
 def markdown(corpo) -> str:
     voci = []
     for r in corpo:
@@ -70,9 +113,28 @@ def main() -> int:
         print(f"[ERRORE] Il changelog di P7MReader.py non ha una sezione per la versione {versione}", file=sys.stderr)
         return 1
     data, corpo = trovata
-    testo = [f"## Novità della versione {versione}" + (f" ({data})" if data else ""), "", markdown(corpo), "",
-             "Scarica il file per il tuo sistema qui sotto e, se vuoi, controllalo con `SHA256SUMS.txt`. "
-             "Dalla 3.2.0 P7MReader si aggiorna anche da solo (*Impostazioni → Aggiornamenti*).", ""]
+    testo = [f"## Novità della versione {versione}" + (f" ({data})" if data else ""), "", markdown(corpo), ""]
+    # versioni dello stesso ramo (es. 3.1 per la 3.1.1) uscite senza una release propria
+    pubblicate = versioni_pubblicate()
+    if pubblicate is not None:
+        elenco = versioni_changelog(sorgente)
+        mie = _numeri(versione)
+        indice = next((i for i, (v, _d) in enumerate(elenco) if _numeri(v) == mie), None)
+        for v, d in (elenco[indice + 1:] if indice is not None else []):
+            n = _numeri(v)
+            if tuple(n) in pubblicate or n[:2] != mie[:2]:
+                break
+            sotto = sezione(sorgente, v)
+            if sotto and markdown(sotto[1]):
+                testo += [f"### Comprende anche la versione {v}" + (f" ({d})" if d else "") + ", uscita senza una release propria",
+                          "", markdown(sotto[1]), ""]
+    testo += [pacchetti(versione), "",
+              "Se vuoi, controlla il file scaricato con `SHA256SUMS.txt`. "
+              "Dalla 3.2.0 P7MReader si aggiorna anche da solo (*Impostazioni → Aggiornamenti*).", ""]
+    attuale = re.search(r'APP_VERSION = "([^"]+)"', sorgente).group(1)
+    if _numeri(versione) < _numeri(attuale):
+        testo += [f"> È disponibile una versione più recente: [P7MReader {attuale}]"
+                  f"(https://github.com/KonjikiNoYami1991/P7MReader/releases/latest).", ""]
     sys.stdout.reconfigure(encoding="utf-8")
     print("\n".join(testo))
     return 0
